@@ -1,0 +1,3 @@
+[console_scripts]
+pair-logistic-mds = pair_logistic_mds.cli:main
+pair-logistic-mds-plot = pair_logistic_mds.plot_cli:main

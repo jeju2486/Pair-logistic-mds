@@ -1,0 +1,5 @@
+include README.md
+include pyproject.toml
+include setup.cfg
+include requirements.txt
+recursive-include pair_logistic_mds/scripts *.R
