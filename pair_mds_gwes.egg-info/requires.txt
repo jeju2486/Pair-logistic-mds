@@ -2,4 +2,6 @@ numpy>=1.23
 pandas>=1.5
 scipy>=1.9
 statsmodels>=0.13
+
+[tree]
 biopython>=1.80

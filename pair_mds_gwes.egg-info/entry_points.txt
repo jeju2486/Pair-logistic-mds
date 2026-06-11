@@ -1,0 +1,3 @@
+[console_scripts]
+pair-mds-gwes = pair_mds_gwes.cli:main
+pair-mds-gwes-plot = pair_mds_gwes.plot_cli:main

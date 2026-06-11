@@ -1,3 +1,20 @@
+Metadata-Version: 2.4
+Name: pair-mds-gwes
+Version: 0.1.4
+Summary: MDS-corrected bidirectional logistic tester for PAN-GWES/SpydrPick candidate pairs
+Author: Seungwon Ko
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.23
+Requires-Dist: pandas>=1.5
+Requires-Dist: scipy>=1.9
+Requires-Dist: statsmodels>=0.13
+Provides-Extra: tree
+Requires-Dist: biopython>=1.80; extra == "tree"
+Dynamic: license-file
+
 # pair-mds-gwes v0.1.1
 
 A pip-installable redesign of the previous `pair_logistic_mds` fixed-MDS path.
