@@ -1,3 +1,15 @@
+Metadata-Version: 2.4
+Name: pair-lmm-gwes
+Version: 0.6.3
+Summary: Standalone low-rank h2-capped LMM pairwise pangenome GWES with PAN-GWES metadata-aware plotting
+Author: Seungwon Ko / ChatGPT
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.23
+Requires-Dist: pandas>=1.5
+Requires-Dist: scipy>=1.9
+
 # pair-lmm-gwes v0.6.3
 
 Standalone low-rank, h2-capped LMM pairwise pangenome GWES tool.
