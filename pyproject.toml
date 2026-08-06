@@ -1,31 +1,30 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pair-mds-gwes"
-version = "0.1.4"
-description = "MDS-corrected bidirectional logistic tester for PAN-GWES/SpydrPick candidate pairs"
+name = "pair-lmm-gwes"
+version = "0.6.3"
+description = "Standalone low-rank h2-capped LMM pairwise pangenome GWES with PAN-GWES metadata-aware plotting"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-authors = [{name = "Seungwon Ko"}]
+authors = [{name = "Seungwon Ko / ChatGPT"}]
 dependencies = [
   "numpy>=1.23",
   "pandas>=1.5",
-  "scipy>=1.9",
-  "statsmodels>=0.13"
+  "scipy>=1.9"
 ]
 
-[project.optional-dependencies]
-tree = ["biopython>=1.80"]
-
 [project.scripts]
-pair-mds-gwes = "pair_mds_gwes.cli:main"
-pair-mds-gwes-plot = "pair_mds_gwes.plot_cli:main"
+pair-lmm-gwes = "pair_lmm_gwes.cli:main"
+pair-lmm-gwes-plot = "pair_lmm_gwes.plot_cli:main"
+pair-lmm-gwes-plot-test = "pair_lmm_gwes.plot_test_cli:main"
+pair-lmm-gwes-build-nj-tree = "pair_lmm_gwes.nj_cli:main"
 
-[tool.setuptools]
-packages = ["pair_mds_gwes"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pair_lmm_gwes*"]
 
 [tool.setuptools.package-data]
-pair_mds_gwes = ["scripts/*.R"]
+pair_lmm_gwes = ["scripts/*.R"]
