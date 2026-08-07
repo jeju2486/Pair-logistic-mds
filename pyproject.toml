@@ -3,28 +3,29 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pair-lmm-gwes"
-version = "0.6.3"
-description = "Standalone low-rank h2-capped LMM pairwise pangenome GWES with PAN-GWES metadata-aware plotting"
+name = "ko-variation"
+version = "0.8.0"
+description = "KOVAR: directional pangenome covariation with logistic mixed models"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [{name = "Seungwon Ko / ChatGPT"}]
+authors = [{name = "Seungwon Ko"}]
 dependencies = [
   "numpy>=1.23",
   "pandas>=1.5",
   "scipy>=1.9"
 ]
 
+[project.urls]
+Repository = "https://github.com/jeju2486/Pair-logistic-mds"
+
 [project.scripts]
-pair-lmm-gwes = "pair_lmm_gwes.cli:main"
-pair-lmm-gwes-plot = "pair_lmm_gwes.plot_cli:main"
-pair-lmm-gwes-plot-test = "pair_lmm_gwes.plot_test_cli:main"
-pair-lmm-gwes-build-nj-tree = "pair_lmm_gwes.nj_cli:main"
+ko-variation = "ko_variation.cli:main"
+ko-variation-plot = "ko_variation.plot_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["pair_lmm_gwes*"]
+include = ["ko_variation*"]
 
 [tool.setuptools.package-data]
-pair_lmm_gwes = ["scripts/*.R"]
+ko_variation = ["scripts/*.R"]
