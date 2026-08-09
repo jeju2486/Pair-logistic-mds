@@ -1,6 +1,6 @@
-# KOVAR 0.8.1
+# KOVAR 0.8.2
 
-> **Experimental statistical release.** KOVAR 0.8.1 uses a binary
+> **Experimental statistical release.** KOVAR 0.8.2 uses a binary
 > mixed-model implementation that still requires broad type-I-error and power
 > validation. Do not treat its output as sole evidence for a biological or
 > clinical conclusion.
@@ -14,7 +14,29 @@ terminology of this project. More precisely, it is a kinship-adjusted
 directional covariation candidate. Statistical direction does not establish
 causality, evolutionary order, or a molecular interaction.
 
-## What changed in 0.8.1
+## What changed in 0.8.2
+
+Version 0.8.2 makes multi-day scans recoverable and separates operational
+diagnostics from the scientific result table:
+
+- writes atomic, versioned checkpoints for completed canonical response
+  patterns and selected full alternative refits;
+- resumes only after verifying input-content and scientific-configuration
+  fingerprints;
+- runs score testing and selected full refits as separately checkpointed stages;
+- reports directional-table construction, response grouping, kinship
+  eigendecomposition, weighted eigendecomposition, tau profiling, scoring,
+  SPA, full-refit, multiple-testing, and checkpoint-I/O timing;
+- estimates dense-worker memory, reports the multiprocessing start method, and
+  warns when the requested worker count exceeds a conservative RAM budget; and
+- writes detailed operational records to `execution_metadata.tsv` without
+  adding checkpoint or timing columns to `ko_variation.tsv`.
+
+Final-state rebuilding and alternative-model warm starts remain deferred: the
+former adds another dense weighted solve, while prototype warm starts did not
+reliably reduce PQL iterations.
+
+## Performance changes introduced in 0.8.1
 
 Version 0.8.1 accelerates the 0.8.0 model without removing candidate pairs or
 changing the tested hypotheses:
@@ -33,7 +55,7 @@ changing the tested hypotheses:
 
 These are calculation-reuse and algebraic optimizations. Version 0.8.1 does
 not add a more restrictive pair filter, approximate the logistic weights with
-an LMM, or add a GPU backend. Checkpoint/resume is not yet implemented.
+an LMM, or add a GPU backend.
 
 ## Model introduced in 0.8.0
 
@@ -178,6 +200,9 @@ Important options:
 | `--null-tolerance` | `1e-7` | PQL convergence tolerance |
 | `--threads` | `1` | Response-wise worker processes |
 | `--predictor-batch-size` | `256` | Predictors scored together per response |
+| `--checkpoint-every` | `100` | Completed tasks per atomic checkpoint shard |
+| `--resume` | off | Resume an exactly matching checkpoint |
+| `--no-checkpoint` | off | Disable checkpoint creation |
 
 `--spa-mode auto` is provisional: it considers SPA only for score-tail results
 with low marginal frequencies or sparse cells. SPA remains experimental and
@@ -189,7 +214,7 @@ KOVAR parallelizes unique response-pattern fits with `--threads`. Dense
 eigendecomposition libraries may also create native threads. To avoid silently
 running, for example, 32 worker processes each with 32 BLAS threads, KOVAR sets
 missing BLAS environment settings to one before importing NumPy/SciPy. Explicit
-user settings are preserved, inspected, written to `run_summary.txt`, and
+user settings are preserved, inspected, written to `execution_metadata.tsv`, and
 warned about when they create nested parallelism.
 
 For a many-worker run, a conservative configuration is:
@@ -211,7 +236,28 @@ to compiled BLAS/LAPACK code, so wrapping the current calls in Cython would not
 remove their dominant numerical cost. Version 0.8.1 instead avoids redundant
 fits and transformations. Full alternative refits still run their own PQL fit
 for every direction passing `--full-refit-p`; that optional effect-estimation
-stage can remain expensive when many directions cross the threshold.
+stage can remain expensive when many directions cross the threshold. Version
+0.8.2 schedules that work after score testing so each stage has independent
+progress and recovery.
+
+### Checkpoint and resume
+
+Checkpoint writing is enabled by default under `OUT/.kovar_checkpoint`. A new
+run refuses to reuse an existing checkpoint directory. Resume must be explicit:
+
+```bash
+ko-variation ... --out kovar_results --resume
+```
+
+KOVAR hashes the FASTA, pair file, optional tree, and scientific settings before
+loading checkpoint shards. A mismatch stops the run rather than combining
+incompatible results. Checkpoint shards are deleted after successful atomic
+final-output writes unless `--keep-checkpoints` is supplied. `--overwrite` does
+not mean resume and does not bypass checkpoint validation.
+
+With the default interval, an abrupt failure can require recomputing at most 99
+completed tasks that had not yet been flushed. Global BH and Bonferroni values
+are calculated only after every score task has been reconstructed.
 
 ## Filters
 
@@ -238,10 +284,11 @@ KOVAR always writes:
   refit, multiple-testing values, statuses, and kinship diagnostics;
 - `response_models.tsv`: one diagnostic record per original eligible response
   locus, including its canonical pattern, complement orientation, pattern
-  multiplicity, and whether its null fit was reused; and
-- `run_summary.txt`: version, release status, dimensions, filters, hypothesis
-  count, covariance construction, exact response-pattern reuse, stage timings,
-  solver backend, and native-thread settings.
+  multiplicity, and whether its null fit was reused;
+- `run_summary.txt`: a concise run/model summary; and
+- `execution_metadata.tsv`: configuration, cache reuse, wall-clock stage
+  timings, worker-summed solver timings, checkpoint I/O, kinship, BLAS,
+  process, and memory diagnostics.
 
 Key `ko_variation.tsv` columns include:
 
@@ -268,7 +315,7 @@ status and missing inferential fields.
 
 ## Plot results
 
-The optional plotter accepts any numeric score column. For 0.8.1 directional
+The optional plotter accepts any numeric score column. For 0.8.2 directional
 results, use `score_primary`:
 
 ```bash
@@ -285,7 +332,7 @@ It can also weaken a real relationship that occurs only within one lineage.
 Conversely, a significant adjusted result does not prove that the pattern arose
 independently in multiple lineages.
 
-KOVAR 0.8.1 does not yet implement a validated globality classifier. Treat
+KOVAR 0.8.2 does not yet implement a validated globality classifier. Treat
 cross-lineage stability analysis, functional annotation, physical linkage,
 mobile-element carriage, shared ecology, and independent replication as
 necessary follow-up work.
@@ -299,7 +346,8 @@ Other important limitations are:
   representation of sample ancestry;
 - a same-matrix GRM can absorb tested signal or lose structure after masking;
 - sparse data can cause separation or failed full refits;
-- interrupted scans cannot yet resume from response-level checkpoints; and
+- checkpoints cannot be reused after inputs, scientific settings, schema, or
+  KOVAR version change; and
 - covariation alone cannot distinguish functional interaction from linkage,
   co-transfer, shared selection, or technical artifacts.
 

@@ -2,7 +2,7 @@
 
 ## Current status
 
-KOVAR 0.8.1 is experimental. The implementation uses a standalone PQL
+KOVAR 0.8.2 is experimental. The implementation uses a standalone PQL
 logistic mixed model, prospective score test, optional saddlepoint calibration,
 and directional output. Passing unit tests establishes software consistency; it
 does not establish statistical calibration.
@@ -33,6 +33,16 @@ The 0.8.1 exact optimizations additionally require tests for:
 - preservation of every original pair and directional hypothesis after cache
   expansion; and
 - accurate cache, stage-timing, and BLAS/process diagnostics.
+
+The 0.8.2 operational layer additionally requires tests for:
+
+- interrupted and resumed score stages versus uninterrupted output;
+- interrupted and resumed full-refit stages versus uninterrupted output;
+- rejection of changed inputs, scientific settings, schema, or KOVAR version;
+- atomic shard and final-output replacement;
+- preservation of result and response-model column order after JSON recovery;
+- deterministic global BH/Bonferroni correction after reconstruction; and
+- conservative memory warnings on fork and spawn multiprocessing paths.
 
 Where feasible, fixed test fixtures should be generated with GMMAT or another
 trusted GLMM implementation and stored with the generation method and software
@@ -118,7 +128,8 @@ Before KOVAR is described as statistically validated rather than experimental:
 Until these gates are met, report findings as exploratory KOVAR covariation
 candidates.
 
-Long performance runs should currently be treated as non-resumable. A later
-checkpoint implementation requires input/configuration fingerprints, atomic
-response shards, and deterministic reconstruction before multiple-testing
-correction; version 0.8.1 does not claim this capability.
+Long performance runs can use the 0.8.2 checkpoint layer, but recovery must be
+tested on the target scheduler and filesystem before relying on it. Resume is
+valid only after exact fingerprint verification. Abrupt failure can lose the
+unflushed tasks in the current checkpoint interval, and global corrections are
+valid only after every task has been reconstructed.

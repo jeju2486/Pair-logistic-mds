@@ -10,6 +10,7 @@ reproduction of GMMAT.
 
 from dataclasses import dataclass
 import math
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -445,6 +446,7 @@ def fit_logistic_mixed(
     weight_floor: float = 1e-8,
     damping: float = 0.8,
     kinship_eigensystem: KinshipEigensystem | None = None,
+    timing: dict[str, float] | None = None,
 ) -> tuple[GLMMFit, dict[str, Any]]:
     """Fit a one-kernel logistic mixed model by PQL/pseudo-REML profiling."""
     y = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -501,6 +503,9 @@ def fit_logistic_mixed(
         )
     else:
         has_shared_covariance = bool(kinship_eigensystem.has_shared_covariance)
+    timing_output = timing if timing is not None else {}
+    timing_output.setdefault("weighted_eigendecomposition", 0.0)
+    timing_output.setdefault("tau_profiling", 0.0)
 
     try:
         for iteration in range(1, max(2, int(max_iter)) + 1):
@@ -509,7 +514,12 @@ def fit_logistic_mixed(
             clipped_count = int(np.count_nonzero(raw_w < weight_floor))
             weights = np.maximum(raw_w, float(weight_floor))
             z = eta + (y - mu) / weights
+            operation_started = time.perf_counter()
             decomp = _weighted_eigen(K, weights, kinship_eigensystem)
+            timing_output["weighted_eigendecomposition"] += (
+                time.perf_counter() - operation_started
+            )
+            operation_started = time.perf_counter()
             tau, boundary, solution = _profile_tau(
                 decomp,
                 z,
@@ -517,6 +527,7 @@ def fit_logistic_mixed(
                 K,
                 has_shared_covariance=has_shared_covariance,
             )
+            timing_output["tau_profiling"] += time.perf_counter() - operation_started
             objective, beta, random_effect, Sinv_C, M_inv = solution
             eta_target = C @ beta + random_effect
             max_change = float(np.max(np.abs(eta_target - eta)))
