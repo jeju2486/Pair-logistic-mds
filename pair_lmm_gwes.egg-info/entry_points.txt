@@ -1,5 +1,0 @@
-[console_scripts]
-pair-lmm-gwes = pair_lmm_gwes.cli:main
-pair-lmm-gwes-build-nj-tree = pair_lmm_gwes.nj_cli:main
-pair-lmm-gwes-plot = pair_lmm_gwes.plot_cli:main
-pair-lmm-gwes-plot-test = pair_lmm_gwes.plot_test_cli:main
