@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import math
 import unittest
+from unittest import mock
 
 import numpy as np
 
 from ko_variation.glmm import (
+    _SpectralWorkingModel,
+    _profile_tau,
+    _weighted_eigen,
+    _working_solution,
     fit_full_glmm,
+    fit_logistic_mixed,
     fit_null_glmm,
+    prepare_kinship_eigensystem,
     score_predictor,
     score_predictor_block,
 )
@@ -158,6 +165,26 @@ class NoRelatednessGLMMTests(unittest.TestCase):
             self.assertAlmostEqual(batched.score_variance, scalar.score_variance, places=14)
             self.assertAlmostEqual(batched.p_score, scalar.p_score, places=15)
 
+    def test_spa_adjustment_can_be_skipped_without_changing_score(self) -> None:
+        predictor, response = _two_by_two_vectors(30, 10, 10, 30)
+        kinship = np.zeros((response.size, response.size), dtype=np.float64)
+        _, cache = fit_null_glmm(1, response, kinship)
+
+        with_spa = score_predictor(predictor, cache)
+        without_spa = score_predictor(
+            predictor,
+            cache,
+            compute_spa_adjustment=False,
+        )
+
+        self.assertEqual(without_spa.status, "OK")
+        self.assertIsNone(without_spa.adjusted_predictor)
+        self.assertAlmostEqual(without_spa.score_u, with_spa.score_u, places=14)
+        self.assertAlmostEqual(
+            without_spa.score_variance, with_spa.score_variance, places=14
+        )
+        self.assertAlmostEqual(without_spa.p_score, with_spa.p_score, places=15)
+
     def test_joint_sample_and_kinship_permutation_is_invariant(self) -> None:
         n = 40
         kinship = np.eye(n, dtype=np.float64)
@@ -183,6 +210,119 @@ class NoRelatednessGLMMTests(unittest.TestCase):
             permuted_score.score_variance, score.score_variance, places=12
         )
         self.assertAlmostEqual(permuted_score.p_score, score.p_score, places=12)
+
+
+class GLMMOptimizationTests(unittest.TestCase):
+    @staticmethod
+    def _working_model() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(29)
+        n = 18
+        basis = rng.normal(size=(n, 6))
+        kinship = basis @ basis.T / basis.shape[1] + 0.1 * np.eye(n)
+        weights = rng.uniform(0.03, 0.24, size=n)
+        z = rng.normal(size=n)
+        C = np.column_stack((np.ones(n), rng.normal(size=n)))
+        return kinship, weights, z, C
+
+    def test_spectral_working_solution_matches_direct_dense_oracle(self) -> None:
+        kinship, weights, z, C = self._working_model()
+        decomp = _weighted_eigen(kinship, weights)
+        spectral = _SpectralWorkingModel.prepare(decomp, z, C, kinship)
+
+        for tau in (0.0, 1e-4, 0.7, 40.0):
+            actual = _working_solution(decomp, z, C, kinship, tau)
+
+            covariance = np.diag(1.0 / weights) + tau * kinship
+            covariance_factor = np.linalg.inv(covariance)
+            Sinv_C = covariance_factor @ C
+            information = C.T @ Sinv_C
+            information_inverse = np.linalg.inv(information)
+            beta = information_inverse @ (C.T @ covariance_factor @ z)
+            residual = z - C @ beta
+            Sinv_residual = covariance_factor @ residual
+            expected_objective = (
+                np.linalg.slogdet(covariance)[1]
+                + np.linalg.slogdet(information)[1]
+                + residual @ Sinv_residual
+            )
+            expected_random = tau * kinship @ Sinv_residual
+
+            self.assertAlmostEqual(actual[0], expected_objective, places=10)
+            self.assertAlmostEqual(
+                spectral.objective(tau), expected_objective, places=10
+            )
+            np.testing.assert_allclose(actual[1], beta, rtol=1e-10, atol=1e-11)
+            np.testing.assert_allclose(
+                actual[2], expected_random, rtol=1e-9, atol=1e-10
+            )
+            np.testing.assert_allclose(actual[3], Sinv_C, rtol=1e-9, atol=1e-10)
+            np.testing.assert_allclose(
+                actual[4], information_inverse, rtol=1e-9, atol=1e-10
+            )
+
+    def test_tau_profile_back_transforms_only_selected_solution(self) -> None:
+        kinship, weights, z, C = self._working_model()
+        decomp = _weighted_eigen(kinship, weights)
+
+        with mock.patch.object(
+            decomp,
+            "solve_from_rotated",
+            wraps=decomp.solve_from_rotated,
+        ) as back_transform, mock.patch.object(
+            decomp,
+            "solve",
+            wraps=decomp.solve,
+        ) as generic_solve:
+            tau, _, solution = _profile_tau(decomp, z, C, kinship)
+
+        self.assertGreaterEqual(tau, 0.0)
+        self.assertTrue(np.isfinite(solution[0]))
+        # The selected fixed-effect columns and residual are combined into one
+        # eigenvector back-transform; all trial objectives stay in coordinates.
+        self.assertEqual(back_transform.call_count, 1)
+        self.assertEqual(generic_solve.call_count, 0)
+
+    def test_reusable_kinship_eigensystem_avoids_first_iteration_eigh(self) -> None:
+        rng = np.random.default_rng(71)
+        n = 24
+        coordinates = np.arange(n)
+        kinship = 0.65 ** np.abs(coordinates[:, None] - coordinates[None, :])
+        response = np.zeros(n, dtype=np.float64)
+        response[rng.choice(n, size=9, replace=False)] = 1.0
+        eigensystem = prepare_kinship_eigensystem(kinship)
+        original_eigh = np.linalg.eigh
+
+        with mock.patch(
+            "ko_variation.glmm.np.linalg.eigh",
+            wraps=original_eigh,
+        ) as uncached_eigh:
+            uncached_fit, _ = fit_logistic_mixed(
+                response,
+                kinship,
+                max_iter=2,
+            )
+        with mock.patch(
+            "ko_variation.glmm.np.linalg.eigh",
+            wraps=original_eigh,
+        ) as cached_eigh:
+            cached_fit, _ = fit_logistic_mixed(
+                response,
+                kinship,
+                max_iter=2,
+                kinship_eigensystem=eigensystem,
+            )
+
+        self.assertEqual(uncached_eigh.call_count, 2)
+        self.assertEqual(cached_eigh.call_count, 1)
+        self.assertEqual(cached_fit.status, uncached_fit.status)
+        self.assertAlmostEqual(cached_fit.tau, uncached_fit.tau, places=6)
+        self.assertAlmostEqual(cached_fit.objective, uncached_fit.objective, places=7)
+        np.testing.assert_allclose(
+            cached_fit.fitted_probability,
+            uncached_fit.fitted_probability,
+            rtol=1e-7,
+            atol=1e-9,
+        )
 
 
 if __name__ == "__main__":

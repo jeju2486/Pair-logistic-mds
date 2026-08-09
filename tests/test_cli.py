@@ -23,7 +23,7 @@ class CommandLineContractTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(
             completed.stdout.strip(),
-            {"KOVAR 0.8.0", "KO-Variation 0.8.0"},
+            {"KOVAR 0.8.1", "KO-Variation 0.8.1"},
         )
 
     def test_help_exposes_directional_glmm_options_and_removes_lmm_controls(self) -> None:
@@ -70,6 +70,9 @@ class CommandLineContractTests(unittest.TestCase):
         self.assertEqual(len(models), 2)
         self.assertIn("model\tdirectional_logistic_mixed_model_pql_score", summary)
         self.assertIn("release_status\texperimental", summary)
+        self.assertIn("solver_backend\tdense_weighted_eigen_pql", summary)
+        self.assertIn("runtime_blas_threads\t", summary)
+        self.assertIn("response_pattern_cache\texact_identical_complement", summary)
 
 
 if __name__ == "__main__":

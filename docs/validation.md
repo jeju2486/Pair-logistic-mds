@@ -2,7 +2,7 @@
 
 ## Current status
 
-KOVAR 0.8.0 is experimental. The implementation introduces a standalone PQL
+KOVAR 0.8.1 is experimental. The implementation uses a standalone PQL
 logistic mixed model, prospective score test, optional saddlepoint calibration,
 and directional output. Passing unit tests establishes software consistency; it
 does not establish statistical calibration.
@@ -22,6 +22,17 @@ calculations for:
 - full alternative fits and confidence intervals;
 - non-convergence, quasi-separation, and boundary variance estimates; and
 - deterministic agreement between single- and multi-process execution.
+
+The 0.8.1 exact optimizations additionally require tests for:
+
+- equality of the legacy and spectral-coordinate variance-component objective;
+- equality of the prepared-kinship and direct first-iteration eigensystems;
+- separately fitted versus reused identical response patterns;
+- separately fitted versus transformed complementary response patterns,
+  including signed score and effect quantities;
+- preservation of every original pair and directional hypothesis after cache
+  expansion; and
+- accurate cache, stage-timing, and BLAS/process diagnostics.
 
 Where feasible, fixed test fixtures should be generated with GMMAT or another
 trusted GLMM implementation and stored with the generation method and software
@@ -106,3 +117,8 @@ Before KOVAR is described as statistically validated rather than experimental:
 
 Until these gates are met, report findings as exploratory KOVAR covariation
 candidates.
+
+Long performance runs should currently be treated as non-resumable. A later
+checkpoint implementation requires input/configuration fingerprints, atomic
+response shards, and deterministic reconstruction before multiple-testing
+correction; version 0.8.1 does not claim this capability.

@@ -1,6 +1,6 @@
-# Statistical model in KOVAR 0.8.0
+# Statistical model in KOVAR 0.8.1
 
-KOVAR 0.8.0 is an **experimental** directional binary-locus association
+KOVAR 0.8.1 is an **experimental** directional binary-locus association
 scanner. It asks whether the state of one locus predicts the state of another
 after accounting for covariance among samples. The result is a
 kinship-adjusted covariation candidate, not proof of a causal or biochemical
@@ -57,7 +57,7 @@ PQL is an approximation. It can be biased when sample size or binary-state
 counts are small, and its calibration must be assessed for the phylogenetic
 structures and frequency range used by KOVAR.
 
-## One null model per response locus
+## One null model per exact response pattern
 
 For each unique response locus, KOVAR first fits the null model
 
@@ -65,10 +65,42 @@ For each unique response locus, KOVAR first fits the null model
 \operatorname{logit}(\mu_{iv}) = \alpha_v + b_{iv}.
 \]
 
+Before fitting, KOVAR bit-packs each eligible binary response and
+canonicalizes the response/complement pair. Identical response vectors share
+the same null fit. For a complemented response,
+
+\[
+Y^*=1-Y,\qquad \mu^*=1-\mu,
+\]
+
+so the Bernoulli working weights, fitted \(\tau_v\), and mixed-model projection
+are unchanged, while signed response quantities are transformed back to the
+original presence-state orientation. KOVAR verifies exact packed-vector
+equality rather than relying on a hash alone.
+
 The fitted response probabilities, working weights, estimated \(\tau_v\), and
-projection quantities are reused for all eligible predictors of that response.
-This is the main computational saving: the expensive mixed null fit is
-response-specific, while individual predictors are screened with score tests.
+projection quantities are reused for all eligible predictors and all original
+loci assigned to that exact canonical pattern. Every requested direction
+remains in the output and in multiple-testing correction. This reuse is not a
+frequency, lineage, or candidate-pair filter.
+
+### PQL calculation reuse
+
+The initial null probability is constant across samples, hence the first
+working-weight matrix is \(W_0=w_0I\). Therefore
+
+\[
+W_0^{1/2}KW_0^{1/2}=w_0K,
+\]
+
+and the prepared eigensystem of \(K\) can be reused exactly for every first PQL
+iteration. Subsequent weights vary by response and sample, so their weighted
+eigenvectors cannot generally be reused as in a linear mixed model.
+
+After each later weighted eigendecomposition, KOVAR rotates the working
+response and fixed-effect design once. Trial values of \(\tau_v\) are profiled
+using diagonal operations in that spectral coordinate system. This changes the
+algebra and amount of computation, not the optimized pseudo-REML objective.
 
 The output reports
 
@@ -177,7 +209,7 @@ reported result.
 
 ### No scientific shrinkage or rank truncation
 
-Version 0.8.0 does not use the 0.7.0 `h2` cap, identity-shrinkage lambda, or
+Version 0.8.1 does not use the 0.7.0 `h2` cap, identity-shrinkage lambda, or
 low-rank kernel truncation. A finite, symmetric covariance is normalized and
 checked for positive semidefiniteness. Only tiny negative eigenvalues consistent
 with floating-point roundoff are corrected; a materially indefinite matrix is

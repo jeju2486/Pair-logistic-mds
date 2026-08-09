@@ -11,7 +11,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .glmm import fit_full_glmm, fit_null_glmm, neglog10, score_predictor_block
+from .glmm import (
+    fit_full_glmm,
+    fit_null_glmm,
+    neglog10,
+    prepare_kinship_eigensystem,
+    score_predictor_block,
+)
 from .spa import spa_pvalue
 
 
@@ -36,6 +42,24 @@ class ScanConfig:
 _GLOBAL_X: np.ndarray | None = None
 _GLOBAL_K: np.ndarray | None = None
 _GLOBAL_CONFIG: ScanConfig | None = None
+_GLOBAL_KINSHIP_EIGENSYSTEM: Any | None = None
+
+
+@dataclass(frozen=True)
+class _ResponseEntry:
+    output_index: int
+    predictor_locus: int
+    response_locus: int
+    response_pattern_flipped: bool
+    row_context: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ResponsePatternTask:
+    pattern_id: int
+    canonical_response_locus: int
+    response_members: tuple[tuple[int, bool], ...]
+    entries: tuple[_ResponseEntry, ...]
 
 _RESERVED_METADATA_COLUMNS = {
     "pair_id", "pair_u", "pair_v", "predictor_locus", "response_locus",
@@ -53,18 +77,44 @@ _RESERVED_METADATA_COLUMNS = {
     "bonferroni_significant", "n_directional_tests", "kinship_source",
     "kinship_rank", "kinship_eigen_min", "kinship_eigen_max",
     "kinship_roundoff_correction",
+    "canonical_response_locus", "response_pattern_id",
+    "response_pattern_flipped", "response_pattern_size", "null_fit_reused",
 }
 
 
-def _init_worker(X: np.ndarray, K: np.ndarray, config: ScanConfig) -> None:
-    global _GLOBAL_X, _GLOBAL_K, _GLOBAL_CONFIG
+def _init_worker(
+    X: np.ndarray,
+    K: np.ndarray,
+    config: ScanConfig,
+    kinship_eigensystem: Any | None = None,
+) -> None:
+    global _GLOBAL_X, _GLOBAL_K, _GLOBAL_CONFIG, _GLOBAL_KINSHIP_EIGENSYSTEM
     _GLOBAL_X = X
     _GLOBAL_K = K
     _GLOBAL_CONFIG = config
+    _GLOBAL_KINSHIP_EIGENSYSTEM = kinship_eigensystem
 
 
 def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _canonical_response_pattern(response: np.ndarray) -> tuple[bytes, bool]:
+    """Return an exact packed response/complement key and its orientation.
+
+    The packed bytes themselves are the dictionary key, rather than a digest.
+    Python dictionaries resolve hash collisions with byte-for-byte equality, so
+    distinct response patterns cannot be merged by a hash collision.
+    """
+    values = np.asarray(response).reshape(-1)
+    if not np.all((values == 0) | (values == 1)):
+        raise ValueError("Response patterns must contain only binary 0/1 values")
+    bits = values.astype(np.uint8, copy=False)
+    packed = np.packbits(bits, bitorder="little").tobytes()
+    complemented = np.packbits(1 - bits, bitorder="little").tobytes()
+    if complemented < packed:
+        return complemented, True
+    return packed, False
 
 
 def pair_counts_fast(
@@ -198,6 +248,76 @@ def _directional_rows(pairs: pd.DataFrame, X: np.ndarray, config: ScanConfig) ->
     return pd.DataFrame(rows)
 
 
+def _response_pattern_tasks(
+    result: pd.DataFrame,
+    X: np.ndarray,
+) -> tuple[list[_ResponsePatternTask], int]:
+    """Group eligible response loci by exact pattern, including complements."""
+    eligible_indices = result.index[result["eligible"] == 1].to_numpy(dtype=np.int64)
+    response_loci = sorted(
+        {int(value) for value in result.loc[eligible_indices, "response_locus"].tolist()}
+    )
+    pattern_for_response: dict[int, tuple[bytes, bool]] = {}
+    members_by_pattern: dict[bytes, list[tuple[int, bool]]] = defaultdict(list)
+    for response_locus in response_loci:
+        pattern, flipped = _canonical_response_pattern(X[:, response_locus])
+        pattern_for_response[response_locus] = (pattern, flipped)
+        members_by_pattern[pattern].append((response_locus, flipped))
+
+    entries_by_pattern: dict[bytes, list[_ResponseEntry]] = defaultdict(list)
+    for index in eligible_indices:
+        row = result.loc[index]
+        response_locus = int(row["response_locus"])
+        pattern, flipped = pattern_for_response[response_locus]
+        entries_by_pattern[pattern].append(
+            _ResponseEntry(
+                output_index=int(index),
+                predictor_locus=int(row["predictor_locus"]),
+                response_locus=response_locus,
+                response_pattern_flipped=flipped,
+                row_context={
+                    "response_maf": row["response_maf"],
+                    "predictor_maf": row["predictor_maf"],
+                    "min_cell": row["min_cell"],
+                },
+            )
+        )
+
+    ordered_patterns = sorted(
+        members_by_pattern,
+        key=lambda pattern: members_by_pattern[pattern][0][0],
+    )
+    tasks: list[_ResponsePatternTask] = []
+    for pattern_id, pattern in enumerate(ordered_patterns):
+        canonical_members = tuple(members_by_pattern[pattern])
+        representative_locus, representative_canonical_flip = canonical_members[0]
+        members = tuple(
+            (response_locus, canonical_flip != representative_canonical_flip)
+            for response_locus, canonical_flip in canonical_members
+        )
+        entries = tuple(
+            _ResponseEntry(
+                output_index=entry.output_index,
+                predictor_locus=entry.predictor_locus,
+                response_locus=entry.response_locus,
+                response_pattern_flipped=(
+                    entry.response_pattern_flipped != representative_canonical_flip
+                ),
+                row_context=entry.row_context,
+            )
+            for entry in entries_by_pattern[pattern]
+        )
+        tasks.append(
+            _ResponsePatternTask(
+                pattern_id=pattern_id,
+                canonical_response_locus=representative_locus,
+                response_members=members,
+                entries=entries,
+            )
+        )
+    return tasks, len(response_loci)
+
+
 def _should_apply_spa(row: dict[str, Any], config: ScanConfig) -> bool:
     if config.spa_mode == "always":
         return True
@@ -242,51 +362,71 @@ def _empty_inference() -> dict[str, Any]:
     }
 
 
-def _worker_response(task: tuple[int, list[tuple[int, int, dict[str, Any]]]]) -> tuple[dict[str, Any], list[tuple[int, dict[str, Any]]]]:
-    response, entries = task
+def _worker_response(
+    task: _ResponsePatternTask,
+) -> tuple[list[dict[str, Any]], list[tuple[int, dict[str, Any]]]]:
     assert _GLOBAL_X is not None and _GLOBAL_K is not None and _GLOBAL_CONFIG is not None
     X = _GLOBAL_X
     K = _GLOBAL_K
     config = _GLOBAL_CONFIG
-    y = X[:, response].astype(np.float64, copy=False)
+    representative = int(task.canonical_response_locus)
+    y = X[:, representative].astype(np.float64, copy=False)
     fit, cache = fit_null_glmm(
-        response,
+        representative,
         y,
         K,
         max_iter=config.null_max_iter,
         tolerance=config.null_tolerance,
+        kinship_eigensystem=_GLOBAL_KINSHIP_EIGENSYSTEM,
     )
-    n_present = int(np.sum(y))
-    null_row = {
-        "response_locus": int(response),
-        "response_prevalence": float(np.mean(y)),
-        "response_maf": float(min(np.mean(y), 1.0 - np.mean(y))),
-        "n_present": n_present,
-        "minor_count": int(min(n_present, y.size - n_present)),
-        "tau_phylogenetic": fit.tau,
-        "latent_phylogenetic_fraction": fit.latent_phylogenetic_fraction,
-        "pql_iterations": fit.iterations,
-        "pql_converged": int(fit.converged),
-        "pql_objective": fit.objective,
-        "max_eta_change": fit.max_eta_change,
-        "min_working_weight": fit.min_weight,
-        "n_weights_clipped": fit.n_weights_clipped,
-        "fixed_effect_rank": int(fit.beta.size),
-        "tau_boundary": int(fit.tau_boundary),
-        "status": fit.status,
-        "message": fit.message,
-    }
+    null_rows: list[dict[str, Any]] = []
+    for response_locus, flipped in task.response_members:
+        original_y = X[:, response_locus]
+        n_present = int(np.sum(original_y))
+        null_rows.append({
+            "response_locus": int(response_locus),
+            "response_prevalence": float(np.mean(original_y)),
+            "response_maf": float(min(np.mean(original_y), 1.0 - np.mean(original_y))),
+            "n_present": n_present,
+            "minor_count": int(min(n_present, y.size - n_present)),
+            "tau_phylogenetic": fit.tau,
+            "latent_phylogenetic_fraction": fit.latent_phylogenetic_fraction,
+            "pql_iterations": fit.iterations,
+            "pql_converged": int(fit.converged),
+            "pql_objective": fit.objective,
+            "max_eta_change": fit.max_eta_change,
+            "min_working_weight": fit.min_weight,
+            "n_weights_clipped": fit.n_weights_clipped,
+            "fixed_effect_rank": int(fit.beta.size),
+            "tau_boundary": int(fit.tau_boundary),
+            "status": fit.status,
+            "message": fit.message,
+            "canonical_response_locus": representative,
+            "response_pattern_id": int(task.pattern_id),
+            "response_pattern_flipped": int(flipped),
+            "response_pattern_size": len(task.response_members),
+            "null_fit_reused": int(response_locus != representative),
+        })
     updates: list[tuple[int, dict[str, Any]]] = []
-    scores_by_output: dict[int, Any] = {}
+    scores_by_predictor: dict[int, Any] = {}
     if fit.status == "OK":
         batch_size = max(1, int(config.predictor_batch_size))
-        for start in range(0, len(entries), batch_size):
-            batch = entries[start:start + batch_size]
-            predictor_block = X[:, [predictor for _, predictor, _ in batch]]
-            block_scores = score_predictor_block(predictor_block, cache)
-            for (output_index, _, _), score in zip(batch, block_scores):
-                scores_by_output[int(output_index)] = score
-    for output_index, predictor, row_context in entries:
+        predictor_loci = list(dict.fromkeys(entry.predictor_locus for entry in task.entries))
+        for start in range(0, len(predictor_loci), batch_size):
+            batch = predictor_loci[start:start + batch_size]
+            predictor_block = X[:, batch]
+            block_scores = score_predictor_block(
+                predictor_block,
+                cache,
+                compute_spa_adjustment=config.spa_mode != "off",
+            )
+            for predictor, score in zip(batch, block_scores):
+                scores_by_predictor[int(predictor)] = score
+    for entry in task.entries:
+        output_index = int(entry.output_index)
+        predictor = int(entry.predictor_locus)
+        flipped = bool(entry.response_pattern_flipped)
+        score_sign = -1.0 if flipped else 1.0
         out = _empty_inference()
         out["tau_phylogenetic"] = fit.tau
         out["latent_phylogenetic_fraction"] = fit.latent_phylogenetic_fraction
@@ -294,13 +434,13 @@ def _worker_response(task: tuple[int, list[tuple[int, int, dict[str, Any]]]]) ->
             out["status"] = f"NULL_{fit.status}"
             updates.append((output_index, out))
             continue
-        score = scores_by_output[output_index]
+        score = scores_by_predictor[predictor]
         out.update({
-            "score_u": score.score_u,
+            "score_u": score_sign * score.score_u,
             "score_variance": score.score_variance,
-            "score_z": score.score_z,
+            "score_z": score_sign * score.score_z,
             "p_score": score.p_score,
-            "beta_score": score.beta_score,
+            "beta_score": score_sign * score.beta_score,
             "se_score": score.se_score,
         })
         if score.status != "OK":
@@ -311,15 +451,20 @@ def _worker_response(task: tuple[int, list[tuple[int, int, dict[str, Any]]]]) ->
         out["p_primary"] = score.p_score
         out["primary_method"] = "score_normal"
 
-        context = dict(row_context)
+        context = dict(entry.row_context)
         context["p_score"] = score.p_score
         if _should_apply_spa(context, config):
             out["spa_applied"] = 1
+            if score.adjusted_predictor is None:
+                raise RuntimeError("SPA adjustment was not prepared for an SPA-selected score")
+            fitted_probability = fit.fitted_probability
+            if flipped:
+                fitted_probability = 1.0 - fitted_probability
             spa = spa_pvalue(
-                score.score_u,
+                score_sign * score.score_u,
                 score.score_variance,
                 score.adjusted_predictor,
-                fit.fitted_probability,
+                fitted_probability,
             )
             out["spa_status"] = spa.status
             out["spa_variance_ratio"] = spa.variance_ratio
@@ -334,12 +479,14 @@ def _worker_response(task: tuple[int, list[tuple[int, int, dict[str, Any]]]]) ->
         out["score_primary"] = neglog10(float(out["p_primary"]))
         if float(config.full_refit_p) > 0 and float(out["p_primary"]) <= float(config.full_refit_p):
             out["full_refit_attempted"] = 1
+            original_y = X[:, entry.response_locus].astype(np.float64, copy=False)
             full = fit_full_glmm(
-                y,
+                original_y,
                 X[:, predictor],
                 K,
                 max_iter=config.null_max_iter,
                 tolerance=config.null_tolerance,
+                kinship_eigensystem=_GLOBAL_KINSHIP_EIGENSYSTEM,
             )
             out.update({
                 "beta_log_odds": full.beta,
@@ -354,7 +501,7 @@ def _worker_response(task: tuple[int, list[tuple[int, int, dict[str, Any]]]]) ->
             if full.status != "OK" and out["status"] == "OK":
                 out["status"] = "OK_REFIT_FAILED"
         updates.append((output_index, out))
-    return null_row, updates
+    return null_rows, updates
 
 
 def _bh_adjust(p_values: np.ndarray) -> np.ndarray:
@@ -381,29 +528,23 @@ def scan_pairs_glmm(
     for key, value in _empty_inference().items():
         result[key] = value
     eligible_indices = result.index[result["eligible"] == 1].to_numpy(dtype=np.int64)
-    tasks_by_response: dict[int, list[tuple[int, int, dict[str, Any]]]] = defaultdict(list)
-    for index in eligible_indices:
-        row = result.loc[index]
-        context = {
-            "response_maf": row["response_maf"],
-            "predictor_maf": row["predictor_maf"],
-            "min_cell": row["min_cell"],
-        }
-        tasks_by_response[int(row["response_locus"])].append(
-            (int(index), int(row["predictor_locus"]), context)
-        )
-    tasks = sorted(tasks_by_response.items(), key=lambda item: item[0])
+    tasks, original_response_count = _response_pattern_tasks(result, X)
+    kinship_eigensystem = prepare_kinship_eigensystem(K) if tasks else None
     if config.progress:
         sys.stderr.write(
             f"[{_now()}] glmm_scan_start input_pairs={len(pairs)} directional_rows={len(result)} "
-            f"eligible={len(eligible_indices)} responses={len(tasks)} threads={max(1, int(config.threads))}\n"
+            f"eligible={len(eligible_indices)} responses={original_response_count} "
+            f"canonical_response_patterns={len(tasks)} "
+            f"reused_response_models={original_response_count-len(tasks)} "
+            f"threads={max(1, int(config.threads))}\n"
         )
         sys.stderr.flush()
 
     null_rows: list[dict[str, Any]] = []
     done = 0
+    represented_responses = 0
     if max(1, int(config.threads)) == 1:
-        _init_worker(X, K, config)
+        _init_worker(X, K, config, kinship_eigensystem)
         iterator = (_worker_response(task) for task in tasks)
         pool = None
     else:
@@ -411,7 +552,7 @@ def scan_pairs_glmm(
         pool = context.Pool(
             processes=max(1, int(config.threads)),
             initializer=_init_worker,
-            initargs=(X, K, config),
+            initargs=(X, K, config, kinship_eigensystem),
         )
         iterator = pool.imap_unordered(
             _worker_response,
@@ -419,12 +560,13 @@ def scan_pairs_glmm(
             chunksize=max(1, int(config.worker_chunk_size)),
         )
     try:
-        for null_row, updates in iterator:
-            null_rows.append(null_row)
+        for task_null_rows, updates in iterator:
+            null_rows.extend(task_null_rows)
             for index, update in updates:
                 for key, value in update.items():
                     result.at[index, key] = value
             done += 1
+            represented_responses += len(task_null_rows)
             if config.progress and (
                 done == 1
                 or done == len(tasks)
@@ -432,7 +574,8 @@ def scan_pairs_glmm(
             ):
                 elapsed = time.time() - started
                 sys.stderr.write(
-                    f"[{_now()}] glmm_response_progress={done}/{len(tasks)} elapsed={elapsed:.1f}s\n"
+                    f"[{_now()}] glmm_response_progress={represented_responses}/{original_response_count} "
+                    f"canonical_patterns={done}/{len(tasks)} elapsed={elapsed:.1f}s\n"
                 )
                 sys.stderr.flush()
     except BaseException:

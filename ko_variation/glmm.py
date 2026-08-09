@@ -31,6 +31,21 @@ class KinshipDiagnostics:
     mean_diagonal: float
 
 
+@dataclass(frozen=True)
+class KinshipEigensystem:
+    """Reusable eigensystem of the prepared sample covariance matrix.
+
+    The eigensystem must have been constructed from the exact ``K`` supplied to
+    :func:`fit_logistic_mixed`.  It allows the first PQL iteration, whose
+    working weights are scalar, to reuse ``K``'s eigenvectors instead of
+    diagonalising a scalar multiple of ``K`` for every response.
+    """
+
+    eigenvalues: np.ndarray
+    eigenvectors: np.ndarray
+    has_shared_covariance: bool
+
+
 @dataclass
 class GLMMFit:
     status: str
@@ -132,6 +147,39 @@ def prepare_kinship(K: np.ndarray, symmetry_tolerance: float = 1e-8) -> tuple[np
     return K, diagnostics
 
 
+def prepare_kinship_eigensystem(K: np.ndarray) -> KinshipEigensystem:
+    """Diagonalise an already prepared kinship matrix for cross-fit reuse.
+
+    This deliberately remains separate from :func:`prepare_kinship` so its
+    existing two-value public return contract is unchanged.  A scan worker can
+    construct this object once and pass it to every null and alternative fit.
+    """
+
+    matrix = np.asarray(K, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("Kinship matrix must be square")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("Kinship matrix contains non-finite values")
+    scale = max(1.0, float(np.max(np.abs(matrix))))
+    if float(np.max(np.abs(matrix - matrix.T))) > 1e-8 * scale:
+        raise ValueError("Kinship matrix must be symmetric")
+    eigvals, eigvecs = np.linalg.eigh(0.5 * (matrix + matrix.T))
+    tolerance = max(1e-12, float(np.max(np.abs(eigvals))) * 1e-10)
+    if float(eigvals[0]) < -tolerance:
+        raise ValueError(
+            f"Kinship matrix is not positive semidefinite (minimum eigenvalue {eigvals[0]:.6g})"
+        )
+    off_diagonal = np.array(matrix, copy=True)
+    np.fill_diagonal(off_diagonal, 0.0)
+    return KinshipEigensystem(
+        eigenvalues=np.clip(eigvals, 0.0, None),
+        eigenvectors=eigvecs,
+        has_shared_covariance=bool(
+            float(np.max(np.abs(off_diagonal))) > 1e-14
+        ),
+    )
+
+
 def _fixed_design(n: int, covariates: Optional[np.ndarray]) -> np.ndarray:
     if covariates is None:
         C = np.ones((n, 1), dtype=np.float64)
@@ -166,19 +214,47 @@ class _WeightedEigen:
             arr = arr.reshape(-1, 1)
         weighted = self.sqrt_w[:, None] * arr
         rotated = self.eigenvectors.T @ weighted
+        solved = self.solve_from_rotated(rotated, tau)
+        return solved[:, 0] if was_vector else solved
+
+    def solve_from_rotated(self, rotated: np.ndarray, tau: float) -> np.ndarray:
+        """Apply the inverse when ``Q.T @ sqrt(W) @ A`` is already known."""
+
+        arr = np.asarray(rotated, dtype=np.float64)
+        was_vector = arr.ndim == 1
+        if was_vector:
+            arr = arr.reshape(-1, 1)
+        if arr.ndim != 2 or arr.shape[0] != self.eigenvalues.size:
+            raise ValueError("Rotated right-hand side has incompatible dimensions")
         denom = 1.0 + float(tau) * self.eigenvalues
-        solved = self.sqrt_w[:, None] * (self.eigenvectors @ (rotated / denom[:, None]))
+        solved = self.sqrt_w[:, None] * (self.eigenvectors @ (arr / denom[:, None]))
         return solved[:, 0] if was_vector else solved
 
     def logdet(self, tau: float) -> float:
         return float(self.logdet_w_inverse + np.sum(np.log1p(float(tau) * self.eigenvalues)))
 
 
-def _weighted_eigen(K: np.ndarray, weights: np.ndarray) -> _WeightedEigen:
+def _weighted_eigen(
+    K: np.ndarray,
+    weights: np.ndarray,
+    kinship_eigensystem: KinshipEigensystem | None = None,
+) -> _WeightedEigen:
     sqrt_w = np.sqrt(weights)
-    B = (sqrt_w[:, None] * K) * sqrt_w[None, :]
-    B = 0.5 * (B + B.T)
-    eigvals, eigvecs = np.linalg.eigh(B)
+    scalar_weight = bool(np.all(weights == weights[0]))
+    if scalar_weight and kinship_eigensystem is not None:
+        eigvals_k = np.asarray(kinship_eigensystem.eigenvalues, dtype=np.float64)
+        eigvecs = np.asarray(kinship_eigensystem.eigenvectors, dtype=np.float64)
+        if eigvals_k.shape != (K.shape[0],) or eigvecs.shape != K.shape:
+            raise ValueError("Kinship eigensystem dimensions do not match K")
+        if not np.all(np.isfinite(eigvals_k)) or not np.all(np.isfinite(eigvecs)):
+            raise ValueError("Kinship eigensystem contains non-finite values")
+        if float(np.min(eigvals_k)) < -1e-12:
+            raise ValueError("Kinship eigensystem contains negative eigenvalues")
+        eigvals = float(weights[0]) * eigvals_k
+    else:
+        B = (sqrt_w[:, None] * K) * sqrt_w[None, :]
+        B = 0.5 * (B + B.T)
+        eigvals, eigvecs = np.linalg.eigh(B)
     tolerance = max(1e-12, float(np.max(np.abs(eigvals))) * 1e-10)
     if float(eigvals[0]) < -tolerance:
         raise np.linalg.LinAlgError(
@@ -193,6 +269,89 @@ def _weighted_eigen(K: np.ndarray, weights: np.ndarray) -> _WeightedEigen:
     )
 
 
+@dataclass
+class _SpectralWorkingModel:
+    """Working Gaussian model represented once in weighted eigen-coordinates."""
+
+    decomp: _WeightedEigen
+    z: np.ndarray
+    C: np.ndarray
+    K: np.ndarray
+    rotated_z: np.ndarray
+    rotated_C: np.ndarray
+
+    @classmethod
+    def prepare(
+        cls,
+        decomp: _WeightedEigen,
+        z: np.ndarray,
+        C: np.ndarray,
+        K: np.ndarray,
+    ) -> "_SpectralWorkingModel":
+        weighted = decomp.sqrt_w[:, None] * np.column_stack((C, z))
+        rotated = decomp.eigenvectors.T @ weighted
+        return cls(
+            decomp=decomp,
+            z=np.asarray(z, dtype=np.float64),
+            C=np.asarray(C, dtype=np.float64),
+            K=np.asarray(K, dtype=np.float64),
+            rotated_z=rotated[:, -1],
+            rotated_C=rotated[:, :-1],
+        )
+
+    def _point(
+        self,
+        tau: float,
+        *,
+        inverse_information: bool,
+    ) -> tuple[float, np.ndarray, np.ndarray | None, np.ndarray]:
+        attenuation = 1.0 / (1.0 + float(tau) * self.decomp.eigenvalues)
+        M = self.rotated_C.T @ (attenuation[:, None] * self.rotated_C)
+        sign, logdet_m = np.linalg.slogdet(M)
+        if sign <= 0 or not np.isfinite(logdet_m):
+            raise np.linalg.LinAlgError("Fixed-effect information matrix is singular")
+        factor = linalg.cho_factor(M, lower=True, check_finite=False)
+        rhs = self.rotated_C.T @ (attenuation * self.rotated_z)
+        beta = linalg.cho_solve(factor, rhs, check_finite=False)
+        rotated_residual = self.rotated_z - self.rotated_C @ beta
+        quad = float(np.sum(attenuation * rotated_residual * rotated_residual))
+        objective = float(self.decomp.logdet(tau) + logdet_m + quad)
+        M_inv = None
+        if inverse_information:
+            M_inv = linalg.cho_solve(
+                factor,
+                np.eye(M.shape[0], dtype=np.float64),
+                check_finite=False,
+            )
+        return objective, beta, M_inv, rotated_residual
+
+    def objective(self, tau: float) -> float:
+        """Evaluate a trial tau without any full eigenvector back-transform."""
+
+        return self._point(float(tau), inverse_information=False)[0]
+
+    def materialize(
+        self,
+        tau: float,
+    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Construct sample-space quantities once for the selected tau."""
+
+        objective, beta, M_inv, rotated_residual = self._point(
+            float(tau), inverse_information=True
+        )
+        assert M_inv is not None
+        rotated_rhs = np.column_stack((self.rotated_C, rotated_residual))
+        solved = self.decomp.solve_from_rotated(rotated_rhs, float(tau))
+        Sinv_C = solved[:, :-1]
+        Sinv_residual = solved[:, -1]
+        # Keep the direct BLUP expression.  Although the covariance identity
+        # ``residual - W^-1 @ Sinv_residual`` is algebraically equivalent, it
+        # subtracts nearly equal vectors when tau is small and can add enough
+        # cancellation error to delay PQL convergence.
+        random_effect = float(tau) * (self.K @ Sinv_residual)
+        return objective, beta, random_effect, Sinv_C, M_inv
+
+
 def _working_solution(
     decomp: _WeightedEigen,
     z: np.ndarray,
@@ -200,25 +359,7 @@ def _working_solution(
     K: np.ndarray,
     tau: float,
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    Sinv_C = decomp.solve(C, tau)
-    M = C.T @ Sinv_C
-    sign, logdet_m = np.linalg.slogdet(M)
-    if sign <= 0 or not np.isfinite(logdet_m):
-        raise np.linalg.LinAlgError("Fixed-effect information matrix is singular")
-    factor = linalg.cho_factor(M, lower=True, check_finite=False)
-    M_inv = linalg.cho_solve(
-        factor,
-        np.eye(M.shape[0], dtype=np.float64),
-        check_finite=False,
-    )
-    Sinv_z = decomp.solve(z, tau)
-    beta = linalg.cho_solve(factor, C.T @ Sinv_z, check_finite=False)
-    residual = z - C @ beta
-    Sinv_residual = decomp.solve(residual, tau)
-    quad = float(residual @ Sinv_residual)
-    objective = float(decomp.logdet(tau) + logdet_m + quad)
-    random_effect = float(tau) * (K @ Sinv_residual)
-    return objective, beta, random_effect, Sinv_C, M_inv
+    return _SpectralWorkingModel.prepare(decomp, z, C, K).materialize(float(tau))
 
 
 def _profile_tau(
@@ -226,33 +367,37 @@ def _profile_tau(
     z: np.ndarray,
     C: np.ndarray,
     K: np.ndarray,
+    has_shared_covariance: bool | None = None,
 ) -> tuple[float, bool, tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    shared = K - np.diag(np.diag(K))
+    if has_shared_covariance is None:
+        off_diagonal = np.array(K, copy=True)
+        np.fill_diagonal(off_diagonal, 0.0)
+        has_shared_covariance = bool(float(np.max(np.abs(off_diagonal))) > 1e-14)
+    working = _SpectralWorkingModel.prepare(decomp, z, C, K)
     if (
-        float(np.max(np.abs(K))) <= 1e-14
-        or float(np.max(np.abs(shared))) <= 1e-14
+        not has_shared_covariance
         or float(np.max(decomp.eigenvalues)) <= 1e-14
     ):
         # A diagonal-only kernel contains no covariance between samples. With
         # one Bernoulli observation per sample, its variance is not a
         # phylogenetic/relatedness component and is not separately identifiable
         # from individual-level logistic variation.
-        solution = _working_solution(decomp, z, C, K, 0.0)
+        solution = working.materialize(0.0)
         return 0.0, False, solution
 
-    cache: dict[float, tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    cache: dict[float, float] = {}
 
-    def evaluate(tau: float):
+    def evaluate(tau: float) -> float:
         key = float(tau)
         if key not in cache:
-            cache[key] = _working_solution(decomp, z, C, K, key)
+            cache[key] = working.objective(key)
         return cache[key]
 
     candidates = [0.0] + list(np.logspace(_TAU_GRID_MIN, _TAU_GRID_MAX, 25))
     values = []
     for tau in candidates:
         try:
-            values.append(evaluate(float(tau))[0])
+            values.append(evaluate(float(tau)))
         except (np.linalg.LinAlgError, ValueError, FloatingPointError):
             values.append(np.inf)
     best = int(np.argmin(values))
@@ -261,7 +406,7 @@ def _profile_tau(
         next_tau = min(_TAU_ABSOLUTE_MAX, candidates[-1] * 100.0)
         candidates.append(float(next_tau))
         try:
-            values.append(evaluate(float(next_tau))[0])
+            values.append(evaluate(float(next_tau)))
         except (np.linalg.LinAlgError, ValueError, FloatingPointError):
             values.append(np.inf)
         best = int(np.argmin(values))
@@ -277,7 +422,7 @@ def _profile_tau(
         if hi > lo:
             try:
                 opt = optimize.minimize_scalar(
-                    lambda log_tau: evaluate(float(math.exp(log_tau)))[0],
+                    lambda log_tau: evaluate(float(math.exp(log_tau))),
                     bounds=(math.log(lo), math.log(hi)),
                     method="bounded",
                     options={"xatol": 1e-6, "maxiter": 100},
@@ -287,7 +432,7 @@ def _profile_tau(
                     best_value = float(opt.fun)
             except (ValueError, FloatingPointError, np.linalg.LinAlgError):
                 pass
-    solution = evaluate(best_tau)
+    solution = working.materialize(best_tau)
     return best_tau, boundary, solution
 
 
@@ -299,6 +444,7 @@ def fit_logistic_mixed(
     tolerance: float = 1e-7,
     weight_floor: float = 1e-8,
     damping: float = 0.8,
+    kinship_eigensystem: KinshipEigensystem | None = None,
 ) -> tuple[GLMMFit, dict[str, Any]]:
     """Fit a one-kernel logistic mixed model by PQL/pseudo-REML profiling."""
     y = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -347,6 +493,14 @@ def fit_logistic_mixed(
     tau_boundary = False
     status = "PQL_NOT_CONVERGED"
     message = "Maximum PQL iterations reached"
+    if kinship_eigensystem is None:
+        off_diagonal = np.array(K, copy=True)
+        np.fill_diagonal(off_diagonal, 0.0)
+        has_shared_covariance = bool(
+            float(np.max(np.abs(off_diagonal))) > 1e-14
+        )
+    else:
+        has_shared_covariance = bool(kinship_eigensystem.has_shared_covariance)
 
     try:
         for iteration in range(1, max(2, int(max_iter)) + 1):
@@ -355,8 +509,14 @@ def fit_logistic_mixed(
             clipped_count = int(np.count_nonzero(raw_w < weight_floor))
             weights = np.maximum(raw_w, float(weight_floor))
             z = eta + (y - mu) / weights
-            decomp = _weighted_eigen(K, weights)
-            tau, boundary, solution = _profile_tau(decomp, z, C, K)
+            decomp = _weighted_eigen(K, weights, kinship_eigensystem)
+            tau, boundary, solution = _profile_tau(
+                decomp,
+                z,
+                C,
+                K,
+                has_shared_covariance=has_shared_covariance,
+            )
             objective, beta, random_effect, Sinv_C, M_inv = solution
             eta_target = C @ beta + random_effect
             max_change = float(np.max(np.abs(eta_target - eta)))
@@ -428,6 +588,7 @@ def fit_logistic_mixed(
         "decomp": last_decomp,
         "Sinv_C": Sinv_C,
         "M_inv": M_inv,
+        "kinship_eigensystem": kinship_eigensystem,
     }
     return fit, cache
 
@@ -447,6 +608,8 @@ def fit_null_glmm(
 def score_predictor_block(
     predictors: np.ndarray,
     cache: dict[str, Any],
+    *,
+    compute_spa_adjustment: bool = True,
 ) -> list[ScoreResult]:
     """Score a sample-by-predictor block with shared mixed-model solves."""
     if not cache:
@@ -484,17 +647,19 @@ def score_predictor_block(
     variances = np.sum(block * PX, axis=0)
     residual = y - np.asarray(cache["mu"])
     scores = block.T @ residual
-    weights = np.asarray(cache["weights"], dtype=np.float64)
-    weighted_information = C.T @ (weights[:, None] * C)
-    weighted_factor = linalg.cho_factor(
-        weighted_information, lower=True, check_finite=False
-    )
-    weighted_coefficient = linalg.cho_solve(
-        weighted_factor,
-        C.T @ (weights[:, None] * block),
-        check_finite=False,
-    )
-    spa_block = block - C @ weighted_coefficient
+    spa_block: np.ndarray | None = None
+    if compute_spa_adjustment:
+        weights = np.asarray(cache["weights"], dtype=np.float64)
+        weighted_information = C.T @ (weights[:, None] * C)
+        weighted_factor = linalg.cho_factor(
+            weighted_information, lower=True, check_finite=False
+        )
+        weighted_coefficient = linalg.cho_solve(
+            weighted_factor,
+            C.T @ (weights[:, None] * block),
+            check_finite=False,
+        )
+        spa_block = block - C @ weighted_coefficient
 
     for local, original in enumerate(valid_indices):
         variance = float(variances[local])
@@ -520,14 +685,25 @@ def score_predictor_block(
             # SPA conditions on independent Bernoulli working means. Its
             # cumulant weights use W-residualization; the mixed-model target
             # variance is reconciled through SPA's variance ratio.
-            adjusted_predictor=spa_block[:, local],
+            adjusted_predictor=(
+                spa_block[:, local] if spa_block is not None else None
+            ),
         )
     return results
 
 
-def score_predictor(predictor: np.ndarray, cache: dict[str, Any]) -> ScoreResult:
+def score_predictor(
+    predictor: np.ndarray,
+    cache: dict[str, Any],
+    *,
+    compute_spa_adjustment: bool = True,
+) -> ScoreResult:
     """Score one predictor; retained as a small public convenience wrapper."""
-    return score_predictor_block(np.asarray(predictor).reshape(-1, 1), cache)[0]
+    return score_predictor_block(
+        np.asarray(predictor).reshape(-1, 1),
+        cache,
+        compute_spa_adjustment=compute_spa_adjustment,
+    )[0]
 
 
 def fit_full_glmm(

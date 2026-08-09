@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ko-variation"
-version = "0.8.0"
+version = "0.8.1"
 description = "KOVAR: directional pangenome covariation with logistic mixed models"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,8 @@ authors = [{name = "Seungwon Ko"}]
 dependencies = [
   "numpy>=1.23",
   "pandas>=1.5",
-  "scipy>=1.9"
+  "scipy>=1.9",
+  "threadpoolctl>=2.2"
 ]
 
 [project.urls]

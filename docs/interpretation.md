@@ -57,7 +57,7 @@ Important consequences are:
 - residual confounding can remain when the tree or GRM poorly represents the
   relevant ancestry.
 
-KOVAR 0.8.0 does not perform ancestral reconstruction or CTMC filtering.
+KOVAR 0.8.1 does not perform ancestral reconstruction or CTMC filtering.
 Cross-lineage stability analysis is a planned diagnostic rather than part of
 the primary test. Claims of globally repeated covariation require lineage-aware
 sensitivity analysis or independent evolutionary evidence.

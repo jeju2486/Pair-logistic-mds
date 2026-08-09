@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 import sys
 import time
 
-# Set these before importing NumPy/SciPy so worker processes do not multiply a
-# dense response-level process pool by a second BLAS thread pool.
-for _blas_variable in (
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "OMP_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-):
-    os.environ.setdefault(_blas_variable, "1")
+# Set conservative defaults before importing NumPy/SciPy so response-level
+# worker processes do not silently multiply a second native thread pool. User
+# settings remain authoritative and are inspected and reported at runtime.
+from .diagnostics import collect_parallel_runtime, guard_blas_environment
+
+guard_blas_environment(default_threads=1)
 
 import numpy as np
 
@@ -158,12 +154,31 @@ def _step(started: float, label: str, message: str = "") -> None:
 def main(argv=None):
     started = time.time()
     args = parse_args(argv)
+    runtime = collect_parallel_runtime(args.threads)
     out = Path(args.out)
     if out.exists() and any(out.iterdir()) and not args.overwrite:
         raise SystemExit(f"Output directory is not empty: {out}. Use --overwrite to continue.")
     out.mkdir(parents=True, exist_ok=True)
     progress = not args.no_progress
 
+    _step(
+        started,
+        "runtime",
+        f"workers={runtime.worker_processes} blas_threads={runtime.effective_blas_threads} "
+        f"estimated_native_threads={runtime.estimated_native_threads} "
+        f"logical_cpus={runtime.logical_cpus}",
+    )
+    for warning in runtime.warnings:
+        sys.stderr.write(
+            f"[KOVAR] warning={warning} workers={runtime.worker_processes} "
+            f"blas_threads={runtime.effective_blas_threads}; "
+            "prefer one BLAS thread per response worker unless benchmarked otherwise\n"
+        )
+    sys.stderr.flush()
+
+    stage_seconds: dict[str, float] = {}
+
+    stage_started = time.monotonic()
     _step(started, "read_fasta")
     fasta = read_fake_fasta(
         args.fasta,
@@ -172,8 +187,10 @@ def main(argv=None):
     )
     X = fasta.X
     n_samples, n_loci = X.shape
+    stage_seconds["read_fasta"] = time.monotonic() - stage_started
     _step(started, "read_fasta", f"samples={n_samples} loci={n_loci}")
 
+    stage_started = time.monotonic()
     _step(started, "read_pairs")
     pairs = validate_pairs(
         read_pairs(args.pairs),
@@ -184,9 +201,11 @@ def main(argv=None):
         pairs = pairs.iloc[:args.max_pairs].copy().reset_index(drop=True)
     if pairs.empty:
         raise SystemExit("No candidate pairs remain after input validation")
+    stage_seconds["read_pairs"] = time.monotonic() - stage_started
     _step(started, "read_pairs", f"pairs={len(pairs)}")
 
     targets = np.unique(pairs[["u", "v"]].to_numpy(dtype=np.int64).reshape(-1))
+    stage_started = time.monotonic()
     if args.tree:
         _step(started, "build_covariance", "source=tree")
         kinship = build_tree_covariance(
@@ -211,6 +230,7 @@ def main(argv=None):
         )
     K, kdiag = prepare_kinship(kinship.K)
     del kinship.K
+    stage_seconds["build_covariance"] = time.monotonic() - stage_started
     _step(
         started,
         "build_covariance",
@@ -239,7 +259,46 @@ def main(argv=None):
         f"direction_mode={args.direction_mode} min_maf={args.min_maf:g} "
         f"min_cell_count={args.min_cell_count} spa={args.spa_mode}",
     )
+    stage_started = time.monotonic()
     results, response_models = scan_pairs_glmm(pairs, X, K, config)
+    stage_seconds["directional_scan"] = time.monotonic() - stage_started
+
+    cache_diagnostics: dict[str, object] = {
+        "response_pattern_cache": "exact_identical_complement",
+        "n_response_loci": len(response_models),
+    }
+    required_cache_columns = {
+        "response_pattern_id",
+        "response_pattern_flipped",
+        "response_pattern_size",
+        "null_fit_reused",
+    }
+    if required_cache_columns.issubset(response_models.columns):
+        reused = response_models["null_fit_reused"].fillna(False).astype(bool)
+        flipped = response_models["response_pattern_flipped"].fillna(False).astype(bool)
+        cache_diagnostics.update(
+            {
+                "n_unique_response_patterns": int(response_models["response_pattern_id"].nunique()),
+                "n_null_glmm_fits": int((~reused).sum()),
+                "n_null_glmm_reused": int(reused.sum()),
+                "n_complement_response_loci": int(flipped.sum()),
+                "max_response_pattern_size": (
+                    int(response_models["response_pattern_size"].max()) if len(response_models) else 0
+                ),
+                "response_pattern_reuse_fraction": float(reused.mean()) if len(reused) else 0.0,
+            }
+        )
+        _step(
+            started,
+            "directional_scan",
+            f"duration={stage_seconds['directional_scan']:.1f}s "
+            f"responses={len(response_models)} "
+            f"unique_patterns={cache_diagnostics['n_unique_response_patterns']} "
+            f"null_fits_reused={cache_diagnostics['n_null_glmm_reused']}",
+        )
+    else:
+        cache_diagnostics["response_pattern_cache"] = "unavailable"
+        _step(started, "directional_scan", f"duration={stage_seconds['directional_scan']:.1f}s")
 
     shared_diagnostics = {
         "kinship_source": kinship.source,
@@ -252,6 +311,7 @@ def main(argv=None):
         results[column] = value
         response_models[column] = value
 
+    stage_started = time.monotonic()
     _step(started, "write_results")
     result_path = out / "ko_variation.tsv"
     model_path = out / "response_models.tsv"
@@ -288,6 +348,15 @@ def main(argv=None):
         summary.write(f"threads\t{args.threads}\n")
         summary.write(f"worker_chunk_size\t{args.worker_chunk_size}\n")
         summary.write(f"predictor_batch_size\t{args.predictor_batch_size}\n")
+        summary.write("solver_backend\tdense_weighted_eigen_pql\n")
+        summary.write("tau_profile_backend\texact_spectral_coordinates\n")
+        summary.write("checkpoint_resume\tnot_implemented\n")
+        for key, value in runtime.summary_fields().items():
+            summary.write(f"{key}\t{value}\n")
+        for key, value in cache_diagnostics.items():
+            summary.write(f"{key}\t{value}\n")
+        for key, value in sorted(stage_seconds.items()):
+            summary.write(f"stage_seconds_{key}\t{value:.6f}\n")
         summary.write(f"near_redundant_mismatch\t{args.near_redundant_mismatch}\n")
         summary.write(f"exclude_near_redundant\t{int(args.exclude_near_redundant)}\n")
         for key in sorted(kinship.details):
@@ -295,6 +364,9 @@ def main(argv=None):
 
     sys.stderr.write("[KOVAR] result_status_counts\n")
     sys.stderr.write(results["status"].fillna("NA").value_counts().to_string() + "\n")
+    stage_seconds["write_results"] = time.monotonic() - stage_started
+    with (out / "run_summary.txt").open("a", encoding="utf-8") as summary:
+        summary.write(f"stage_seconds_write_results\t{stage_seconds['write_results']:.6f}\n")
     _step(started, "complete", f"results={result_path} response_models={model_path}")
 
 

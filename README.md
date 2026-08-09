@@ -1,6 +1,6 @@
-# KOVAR 0.8.0
+# KOVAR 0.8.1
 
-> **Experimental statistical release.** KOVAR 0.8.0 introduces a new binary
+> **Experimental statistical release.** KOVAR 0.8.1 uses a binary
 > mixed-model implementation that still requires broad type-I-error and power
 > validation. Do not treat its output as sole evidence for a biological or
 > clinical conclusion.
@@ -14,7 +14,28 @@ terminology of this project. More precisely, it is a kinship-adjusted
 directional covariation candidate. Statistical direction does not establish
 causality, evolutionary order, or a molecular interaction.
 
-## What changed in 0.8.0
+## What changed in 0.8.1
+
+Version 0.8.1 accelerates the 0.8.0 model without removing candidate pairs or
+changing the tested hypotheses:
+
+- identifies identical and complementary binary response patterns and fits one
+  null GLMM per exact canonical pattern;
+- maps every cached fit back to every original response locus and preserves all
+  requested directional result rows;
+- reuses the tree/GRM eigensystem exactly in the first PQL iteration, when the
+  initial working weight is constant;
+- evaluates the variance-component profile in spectral coordinates, avoiding
+  repeated sample-space transformations for each trial value of `tau`;
+- skips SPA-specific predictor preparation when `--spa-mode off`;
+- records response-cache, solver, stage-timing, BLAS-library, and process-pool
+  diagnostics, with a warning for nested native-thread oversubscription.
+
+These are calculation-reuse and algebraic optimizations. Version 0.8.1 does
+not add a more restrictive pair filter, approximate the logistic weights with
+an LMM, or add a GPU backend. Checkpoint/resume is not yet implemented.
+
+## Model introduced in 0.8.0
 
 Version 0.8.0 replaces the 0.7.0 linear mixed-model scan with an experimental
 directional logistic mixed model:
@@ -51,9 +72,10 @@ b_v\sim N(0,\tau_vK).
 The sample covariance \(K\) preferably comes from an external core-genome tree.
 A proxy-masked pangenome GRM is available when no tree is supplied.
 
-KOVAR fits one null model per response locus and reuses it for eligible
-predictors. This design is inspired by GMMAT, but KOVAR is a standalone
-NumPy/SciPy implementation and not an exact numerical reproduction of GMMAT.
+KOVAR fits one null model per exact binary response pattern and reuses it for
+eligible predictors and loci with an identical or complementary pattern. This
+design is inspired by GMMAT, but KOVAR is a standalone NumPy/SciPy
+implementation and not an exact numerical reproduction of GMMAT.
 
 See [the statistical model](docs/model.md), [interpretation
 guidance](docs/interpretation.md), and [research foundations](docs/research_basis.md).
@@ -73,8 +95,10 @@ ko-variation --version
 ko-variation --help
 ```
 
-The core scanner requires NumPy, pandas, and SciPy. The optional plotting
-command also requires R and `data.table`; `ggplot2` is optional.
+The core scanner requires NumPy, pandas, SciPy, and `threadpoolctl`. The latter
+reports the native BLAS thread configuration used by the dense solver. The
+optional plotting command also requires R and `data.table`; `ggplot2` is
+optional.
 
 ## Inputs
 
@@ -159,6 +183,36 @@ Important options:
 with low marginal frequencies or sparse cells. SPA remains experimental and
 cannot compensate for insufficient joint counts or a lineage-confined pattern.
 
+### Long-run performance diagnostics
+
+KOVAR parallelizes unique response-pattern fits with `--threads`. Dense
+eigendecomposition libraries may also create native threads. To avoid silently
+running, for example, 32 worker processes each with 32 BLAS threads, KOVAR sets
+missing BLAS environment settings to one before importing NumPy/SciPy. Explicit
+user settings are preserved, inspected, written to `run_summary.txt`, and
+warned about when they create nested parallelism.
+
+For a many-worker run, a conservative configuration is:
+
+```bash
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+ko-variation ... --threads 32
+```
+
+The fastest process/thread combination depends on sample count, RAM bandwidth,
+and the installed BLAS library; benchmark a representative subset before a
+multi-day analysis.
+
+NumPy/SciPy already dispatch the dense eigendecomposition and matrix products
+to compiled BLAS/LAPACK code, so wrapping the current calls in Cython would not
+remove their dominant numerical cost. Version 0.8.1 instead avoids redundant
+fits and transformations. Full alternative refits still run their own PQL fit
+for every direction passing `--full-refit-p`; that optional effect-estimation
+stage can remain expensive when many directions cross the threshold.
+
 ## Filters
 
 The 5% marginal filter is calculated as
@@ -182,12 +236,14 @@ KOVAR always writes:
 - `ko_variation.tsv`: one row per requested direction, including oriented
   counts, frequencies, score test, primary p-value, optional SPA, optional full
   refit, multiple-testing values, statuses, and kinship diagnostics;
-- `response_models.tsv`: one PQL null-model diagnostic record per fitted
-  response locus; and
+- `response_models.tsv`: one diagnostic record per original eligible response
+  locus, including its canonical pattern, complement orientation, pattern
+  multiplicity, and whether its null fit was reused; and
 - `run_summary.txt`: version, release status, dimensions, filters, hypothesis
-  count, covariance construction, and execution settings.
+  count, covariance construction, exact response-pattern reuse, stage timings,
+  solver backend, and native-thread settings.
 
-Key result columns include:
+Key `ko_variation.tsv` columns include:
 
 ```text
 pair_id u v predictor_locus response_locus direction
@@ -200,12 +256,19 @@ beta_log_odds se_log_odds odds_ratio odds_ratio_ci_low odds_ratio_ci_high
 full_refit_status q_bh bonferroni_significant n_directional_tests
 ```
 
+Key response-cache diagnostics in `response_models.tsv` include:
+
+```text
+response_locus canonical_response_locus response_pattern_id
+response_pattern_flipped response_pattern_size null_fit_reused
+```
+
 Filtered and failed directions remain in `ko_variation.tsv` with an explicit
 status and missing inferential fields.
 
 ## Plot results
 
-The optional plotter accepts any numeric score column. For 0.8.0 directional
+The optional plotter accepts any numeric score column. For 0.8.1 directional
 results, use `score_primary`:
 
 ```bash
@@ -222,7 +285,7 @@ It can also weaken a real relationship that occurs only within one lineage.
 Conversely, a significant adjusted result does not prove that the pattern arose
 independently in multiple lineages.
 
-KOVAR 0.8.0 does not yet implement a validated globality classifier. Treat
+KOVAR 0.8.1 does not yet implement a validated globality classifier. Treat
 cross-lineage stability analysis, functional annotation, physical linkage,
 mobile-element carriage, shared ecology, and independent replication as
 necessary follow-up work.
@@ -235,7 +298,8 @@ Other important limitations are:
 - an external tree is only as suitable as its rooting, branch lengths, and
   representation of sample ancestry;
 - a same-matrix GRM can absorb tested signal or lose structure after masking;
-- sparse data can cause separation or failed full refits; and
+- sparse data can cause separation or failed full refits;
+- interrupted scans cannot yet resume from response-level checkpoints; and
 - covariation alone cannot distinguish functional interaction from linkage,
   co-transfer, shared selection, or technical artifacts.
 
