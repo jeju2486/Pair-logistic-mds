@@ -4,7 +4,7 @@ KOVAR keeps production analysis code in the installed `ko_variation` package.
 Validation simulations and benchmarks belong outside that package so they do
 not become runtime accessory functions.
 
-## Version 0.8.1 production structure
+## Version 0.8.2 production structure
 
 ```text
 KOVAR/
@@ -22,7 +22,8 @@ KOVAR/
 |-- ko_variation/
 |   |-- __init__.py       # Version metadata
 |   |-- cli.py            # Workflow, arguments and outputs
-|   |-- diagnostics.py    # Native-thread and process diagnostics
+|   |-- checkpoint.py     # Atomic shards, fingerprints and resume validation
+|   |-- diagnostics.py    # Native-thread, process and memory diagnostics
 |   |-- io_utils.py       # FASTA and candidate-pair input
 |   |-- kinship.py        # Tree covariance and fallback GRM
 |   |-- glmm.py           # PQL fit, score test and full refit
@@ -35,12 +36,12 @@ KOVAR/
 ```
 
 The earlier LMM, CTMC/event filtration, ancestral-state reconstruction,
-neighbor-joining construction, and test-only plotter are not part of the 0.8.1
+neighbor-joining construction, and test-only plotter are not part of the 0.8.2
 package.
 
 ## Response-pattern-first execution
 
-The 0.8.1 scanner keeps the public directional table unchanged while scheduling
+The 0.8.2 scanner keeps the public directional table unchanged while scheduling
 the expensive null-model stage by exact binary response pattern:
 
 ```text
@@ -49,7 +50,15 @@ validated candidate pairs
     `-- exact canonical response patterns
         |-- one null PQL fit per pattern
         |-- batched predictor score tests
+        |-- atomic score-stage checkpoint shards
         `-- transformed diagnostics for identical/complement response loci
+
+all score patterns complete
+`-- selected full alternative fits
+    `-- independently checkpointed full-refit tasks
+
+all tasks reconstructed
+`-- global BH/Bonferroni correction and atomic final outputs
 ```
 
 Canonicalization chooses one deterministic representative from a response and
@@ -87,12 +96,13 @@ features.
 A later `lineage.py` module may provide leave-one-lineage-out influence and
 effect-heterogeneity summaries. It should remain a diagnostic rather than a
 CTMC or ancestral-event filter. Classification thresholds require simulation,
-so version 0.8.1 does not claim an implemented globality classifier.
+so version 0.8.2 does not claim an implemented globality classifier.
 
 ## Dependency direction
 
 ```text
 cli.py
+|-- checkpoint.py
 |-- diagnostics.py
 |-- io_utils.py
 |-- kinship.py
@@ -106,13 +116,16 @@ plot_cli.py
 
 `glmm.py` and `spa.py` contain statistical calculations and do not perform file
 I/O. `scan.py` organizes hypotheses, exact response-pattern reuse, filters, and
-corrections. The CLI owns paths and file creation. `diagnostics.py` inspects
-native library/process settings but does not alter an explicit user setting.
+corrections. The CLI owns final paths and atomic output creation.
+`checkpoint.py` owns versioned manifests and atomic compressed shards.
+`diagnostics.py` inspects native-library, process, and memory settings but does
+not alter an explicit user setting or automatically replace `--threads`.
 
 ## Deliberately deferred work
 
-Version 0.8.1 does not include GPU execution, hard pair filtering for runtime,
-or response-level checkpoint/resume. A safe checkpoint implementation must be
-integrated with response scheduling, configuration/input fingerprints, atomic
-shard writes, and deterministic final multiple-testing correction; a
-write-at-program-end wrapper would not provide reliable resume behavior.
+Version 0.8.2 does not include GPU execution or hard pair filtering for runtime.
+It also defers automatic worker-count selection, final-state PQL rebuilding,
+and alternative-model warm starts. Memory diagnostics provide a conservative
+safety recommendation, while worker speed remains a dataset- and BLAS-specific
+benchmarking decision. Warm starts require additional convergence evidence;
+final-state rebuilding requires measuring the cost of another weighted solve.

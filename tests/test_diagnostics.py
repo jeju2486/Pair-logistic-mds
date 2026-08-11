@@ -8,6 +8,7 @@ from ko_variation.diagnostics import (
     BLAS_ENVIRONMENT_VARIABLES,
     NativeLibrary,
     assess_parallel_runtime,
+    estimate_scan_memory,
     guard_blas_environment,
 )
 
@@ -45,6 +46,35 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
         self.assertEqual(runtime.estimated_native_threads, 4)
         self.assertFalse(runtime.warnings)
         self.assertEqual(runtime.summary_fields()["runtime_blas_oversubscribed"], 0)
+
+    def test_memory_estimate_warns_when_dense_workers_exceed_budget(self) -> None:
+        estimate = estimate_scan_memory(
+            n_samples=2_000,
+            n_loci=1_000_000,
+            worker_processes=64,
+            predictor_batch_size=256,
+            logical_cpus=160,
+            available_bytes=8 * 2**30,
+            start_method="fork",
+        )
+        self.assertGreater(estimate.private_bytes_per_worker, 0)
+        self.assertLess(estimate.recommended_max_workers_by_memory, 64)
+        self.assertIn("dense_worker_memory_pressure", estimate.warnings)
+        self.assertIn("workers_exceed_memory_recommendation", estimate.warnings)
+
+    def test_spawn_estimate_accounts_for_copied_input_matrix(self) -> None:
+        common = dict(
+            n_samples=100,
+            n_loci=1_000_000,
+            worker_processes=4,
+            predictor_batch_size=64,
+            logical_cpus=8,
+            available_bytes=64 * 2**30,
+        )
+        forked = estimate_scan_memory(**common, start_method="fork")
+        spawned = estimate_scan_memory(**common, start_method="spawn")
+        self.assertGreater(spawned.private_bytes_per_worker, forked.private_bytes_per_worker)
+        self.assertIn("spawn_duplicates_input_arrays", spawned.warnings)
 
 
 if __name__ == "__main__":

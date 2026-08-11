@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 import time
@@ -8,17 +9,24 @@ import time
 # Set conservative defaults before importing NumPy/SciPy so response-level
 # worker processes do not silently multiply a second native thread pool. User
 # settings remain authoritative and are inspected and reported at runtime.
-from .diagnostics import collect_parallel_runtime, guard_blas_environment
+from .diagnostics import (
+    collect_parallel_runtime,
+    estimate_scan_memory,
+    guard_blas_environment,
+)
 
 guard_blas_environment(default_threads=1)
 
 import numpy as np
+import pandas as pd
+import scipy
 
 from . import __version__
+from .checkpoint import CheckpointError, CheckpointStore, fingerprint_inputs
 from .glmm import prepare_kinship
 from .io_utils import read_fake_fasta, read_pairs, validate_pairs
 from .kinship import build_background_grm, build_tree_covariance
-from .scan import ScanConfig, scan_pairs_glmm
+from .scan import ScanConfig, ScanMetrics, scan_pairs_glmm
 
 
 def parse_args(argv=None):
@@ -125,6 +133,31 @@ def parse_args(argv=None):
     output_group = parser.add_argument_group("execution and output")
     output_group.add_argument("--no-progress", action="store_true", help="Suppress progress messages.")
     output_group.add_argument("--overwrite", action="store_true", help="Write into a non-empty output directory.")
+    output_group.add_argument(
+        "--checkpoint-dir",
+        help="Checkpoint directory [OUT/.kovar_checkpoint].",
+    )
+    output_group.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=100,
+        help="Atomically checkpoint after this many completed tasks [100].",
+    )
+    output_group.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an exactly matching checkpoint.",
+    )
+    output_group.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="Disable checkpoint writing for this run.",
+    )
+    output_group.add_argument(
+        "--keep-checkpoints",
+        action="store_true",
+        help="Keep checkpoint shards after final outputs are written.",
+    )
     output_group.add_argument("--version", action="version", version=f"KO-Variation {__version__}")
     args = parser.parse_args(argv)
 
@@ -142,6 +175,12 @@ def parse_args(argv=None):
         parser.error("--grm-proxy-r2 must be between 0 and 1")
     if not 0.0 <= args.grm_proxy_mismatch <= 1.0:
         parser.error("--grm-proxy-mismatch must be between 0 and 1")
+    if args.checkpoint_every < 1:
+        parser.error("--checkpoint-every must be positive")
+    if args.resume and args.no_checkpoint:
+        parser.error("--resume cannot be combined with --no-checkpoint")
+    if args.keep_checkpoints and args.no_checkpoint:
+        parser.error("--keep-checkpoints cannot be combined with --no-checkpoint")
     return args
 
 
@@ -151,13 +190,102 @@ def _step(started: float, label: str, message: str = "") -> None:
     sys.stderr.flush()
 
 
+def _atomic_dataframe_write(frame, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_csv(temporary, sep="\t", index=False, na_rep="NA")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _atomic_text_write(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _checkpoint_identity(
+    args,
+    *,
+    input_fingerprints: dict[str, object],
+    n_samples: int,
+    n_loci: int,
+    n_pairs: int,
+    blas_libraries: str,
+) -> dict[str, object]:
+    """Scientific inputs/settings that must match before work can be reused."""
+
+    return {
+        "tool": "KO-Variation",
+        "version": __version__,
+        "inputs": input_fingerprints,
+        "dimensions": {
+            "n_samples": n_samples,
+            "n_loci": n_loci,
+            "n_pairs": n_pairs,
+        },
+        "numerical_environment": {
+            "python": ".".join(str(value) for value in sys.version_info[:3]),
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "scipy": scipy.__version__,
+            "blas_libraries": blas_libraries,
+        },
+        "settings": {
+            "presence_char": args.presence_char,
+            "absence_char": args.absence_char,
+            "drop_invalid_pairs": bool(args.drop_invalid_pairs),
+            "max_pairs": args.max_pairs,
+            "tree_missing_length": args.tree_missing_length,
+            "min_maf": args.min_maf,
+            "min_cell_count": args.min_cell_count,
+            "near_redundant_mismatch": args.near_redundant_mismatch,
+            "exclude_near_redundant": bool(args.exclude_near_redundant),
+            "direction_mode": args.direction_mode,
+            "spa_mode": args.spa_mode,
+            "full_refit_p": args.full_refit_p,
+            "null_max_iter": args.null_max_iter,
+            "null_tolerance": args.null_tolerance,
+            "predictor_batch_size": args.predictor_batch_size,
+            "kinship_min_mac": args.kinship_min_mac,
+            "kinship_chunk_size": args.kinship_chunk_size,
+            "kinship_dtype": args.kinship_dtype,
+            "grm_proxy_r2": args.grm_proxy_r2,
+            "grm_proxy_mismatch": args.grm_proxy_mismatch,
+            "grm_target_chunk_size": args.grm_target_chunk_size,
+            "grm_locus_chunk_size": args.grm_locus_chunk_size,
+        },
+    }
+
+
+def _metadata_rows(
+    category: str,
+    fields: dict[str, object],
+    *,
+    unit: str = "",
+) -> list[dict[str, object]]:
+    return [
+        {"category": category, "metric": key, "value": value, "unit": unit}
+        for key, value in sorted(fields.items())
+    ]
+
+
 def main(argv=None):
     started = time.time()
     args = parse_args(argv)
     runtime = collect_parallel_runtime(args.threads)
     out = Path(args.out)
-    if out.exists() and any(out.iterdir()) and not args.overwrite:
-        raise SystemExit(f"Output directory is not empty: {out}. Use --overwrite to continue.")
+    if out.exists() and any(out.iterdir()) and not args.overwrite and not args.resume:
+        raise SystemExit(
+            f"Output directory is not empty: {out}. Use --overwrite for a new run "
+            "or --resume for an exactly matching checkpoint."
+        )
     out.mkdir(parents=True, exist_ok=True)
     progress = not args.no_progress
 
@@ -238,6 +366,80 @@ def main(argv=None):
         f"eig_min={kdiag.eigen_min:.3g} eig_max={kdiag.eigen_max:.3g}",
     )
 
+    memory_estimate = estimate_scan_memory(
+        n_samples=n_samples,
+        n_loci=n_loci,
+        worker_processes=args.threads,
+        predictor_batch_size=args.predictor_batch_size,
+        logical_cpus=runtime.logical_cpus,
+    )
+    _step(
+        started,
+        "memory",
+        f"available_gib={memory_estimate.available_bytes / 2**30:.2f} "
+        f"private_worker_mib={memory_estimate.private_bytes_per_worker / 2**20:.1f} "
+        f"requested_private_gib={memory_estimate.requested_private_worker_bytes / 2**30:.2f} "
+        f"recommended_max_workers={memory_estimate.recommended_max_workers_by_memory} "
+        f"start_method={memory_estimate.start_method}",
+    )
+    for warning in memory_estimate.warnings:
+        sys.stderr.write(
+            f"[KOVAR] warning={warning} requested_workers={args.threads} "
+            f"memory_recommended_max={memory_estimate.recommended_max_workers_by_memory}\n"
+        )
+    sys.stderr.flush()
+
+    checkpoint: CheckpointStore | None = None
+    if not args.no_checkpoint:
+        stage_started = time.monotonic()
+        _step(started, "checkpoint_fingerprint")
+        fingerprint_sources: list[tuple[str, str]] = [
+            ("fasta", args.fasta),
+            ("pairs", args.pairs),
+        ]
+        if args.tree:
+            fingerprint_sources.append(("tree", args.tree))
+        try:
+            input_fingerprints = fingerprint_inputs(fingerprint_sources)
+            identity = _checkpoint_identity(
+                args,
+                input_fingerprints=input_fingerprints,
+                n_samples=n_samples,
+                n_loci=n_loci,
+                n_pairs=len(pairs),
+                blas_libraries=str(
+                    runtime.summary_fields().get("runtime_blas_libraries", "unresolved")
+                ),
+            )
+            checkpoint_path = (
+                Path(args.checkpoint_dir)
+                if args.checkpoint_dir
+                else out / ".kovar_checkpoint"
+            )
+            resolved_checkpoint = checkpoint_path.resolve()
+            resolved_out = out.resolve()
+            if resolved_checkpoint == resolved_out or resolved_out.is_relative_to(
+                resolved_checkpoint
+            ):
+                raise CheckpointError(
+                    "Checkpoint directory must not be the output directory or one of its parents"
+                )
+            checkpoint = CheckpointStore(
+                checkpoint_path,
+                identity,
+                tool_version=__version__,
+                every=args.checkpoint_every,
+                resume=args.resume,
+            )
+        except CheckpointError as exc:
+            raise SystemExit(f"Checkpoint error: {exc}") from exc
+        stage_seconds["checkpoint_fingerprint"] = time.monotonic() - stage_started
+        _step(
+            started,
+            "checkpoint_fingerprint",
+            f"resume={int(args.resume)} directory={checkpoint.root}",
+        )
+
     config = ScanConfig(
         min_maf=args.min_maf,
         min_cell_count=args.min_cell_count,
@@ -259,8 +461,19 @@ def main(argv=None):
         f"direction_mode={args.direction_mode} min_maf={args.min_maf:g} "
         f"min_cell_count={args.min_cell_count} spa={args.spa_mode}",
     )
+    scan_metrics = ScanMetrics()
     stage_started = time.monotonic()
-    results, response_models = scan_pairs_glmm(pairs, X, K, config)
+    try:
+        results, response_models = scan_pairs_glmm(
+            pairs,
+            X,
+            K,
+            config,
+            checkpoint=checkpoint,
+            metrics=scan_metrics,
+        )
+    except CheckpointError as exc:
+        raise SystemExit(f"Checkpoint error: {exc}") from exc
     stage_seconds["directional_scan"] = time.monotonic() - stage_started
 
     cache_diagnostics: dict[str, object] = {
@@ -315,59 +528,100 @@ def main(argv=None):
     _step(started, "write_results")
     result_path = out / "ko_variation.tsv"
     model_path = out / "response_models.tsv"
-    results.to_csv(result_path, sep="\t", index=False, na_rep="NA")
-    response_models.to_csv(model_path, sep="\t", index=False, na_rep="NA")
+    summary_path = out / "run_summary.txt"
+    metadata_path = out / "execution_metadata.tsv"
+    _atomic_dataframe_write(results, result_path)
+    _atomic_dataframe_write(response_models, model_path)
+    stage_seconds["write_primary_outputs"] = time.monotonic() - stage_started
     tested = int(np.isfinite(results["p_primary"].to_numpy(dtype=np.float64)).sum())
-    with (out / "run_summary.txt").open("w", encoding="utf-8") as summary:
-        summary.write(f"version\t{__version__}\n")
-        summary.write("tool\tKO-Variation\n")
-        summary.write("acronym\tKOVAR\n")
-        summary.write("release_status\texperimental\n")
-        summary.write("model\tdirectional_logistic_mixed_model_pql_score\n")
-        summary.write("interpretation\tdirectional_covariation_not_causal_direction\n")
-        summary.write(f"n_samples\t{n_samples}\n")
-        summary.write(f"n_loci\t{n_loci}\n")
-        summary.write(f"n_input_pairs\t{len(pairs)}\n")
-        summary.write(f"n_directional_rows\t{len(results)}\n")
-        summary.write(f"n_directional_tests\t{tested}\n")
-        summary.write(f"direction_mode\t{args.direction_mode}\n")
-        summary.write(f"min_maf\t{args.min_maf}\n")
-        summary.write(f"min_cell_count\t{args.min_cell_count}\n")
-        summary.write(f"spa_mode\t{args.spa_mode}\n")
-        summary.write(f"full_refit_p\t{args.full_refit_p}\n")
-        summary.write(f"kinship_source\t{kinship.source}\n")
-        summary.write(f"tree\t{args.tree or 'NA'}\n")
-        summary.write(f"kinship_rank\t{kdiag.rank}\n")
-        summary.write(f"kinship_eigen_min\t{kdiag.eigen_min}\n")
-        summary.write(f"kinship_eigen_max\t{kdiag.eigen_max}\n")
-        summary.write(f"kinship_roundoff_correction\t{kdiag.roundoff_correction}\n")
-        summary.write(f"kinship_mean_diag_before_norm\t{kinship.mean_diag_before_norm}\n")
-        summary.write(f"kinship_loci_used\t{kinship.n_loci_used}\n")
-        summary.write(f"null_max_iter\t{args.null_max_iter}\n")
-        summary.write(f"null_tolerance\t{args.null_tolerance}\n")
-        summary.write(f"threads\t{args.threads}\n")
-        summary.write(f"worker_chunk_size\t{args.worker_chunk_size}\n")
-        summary.write(f"predictor_batch_size\t{args.predictor_batch_size}\n")
-        summary.write("solver_backend\tdense_weighted_eigen_pql\n")
-        summary.write("tau_profile_backend\texact_spectral_coordinates\n")
-        summary.write("checkpoint_resume\tnot_implemented\n")
-        for key, value in runtime.summary_fields().items():
-            summary.write(f"{key}\t{value}\n")
-        for key, value in cache_diagnostics.items():
-            summary.write(f"{key}\t{value}\n")
-        for key, value in sorted(stage_seconds.items()):
-            summary.write(f"stage_seconds_{key}\t{value:.6f}\n")
-        summary.write(f"near_redundant_mismatch\t{args.near_redundant_mismatch}\n")
-        summary.write(f"exclude_near_redundant\t{int(args.exclude_near_redundant)}\n")
-        for key in sorted(kinship.details):
-            summary.write(f"kinship_detail_{key}\t{kinship.details[key]}\n")
+
+    checkpoint_enabled = checkpoint is not None
+    summary_lines = [
+        f"version\t{__version__}",
+        "tool\tKO-Variation",
+        "acronym\tKOVAR",
+        "release_status\texperimental",
+        "model\tdirectional_logistic_mixed_model_pql_score",
+        "interpretation\tdirectional_covariation_not_causal_direction",
+        f"n_samples\t{n_samples}",
+        f"n_loci\t{n_loci}",
+        f"n_input_pairs\t{len(pairs)}",
+        f"n_directional_rows\t{len(results)}",
+        f"n_directional_tests\t{tested}",
+        f"direction_mode\t{args.direction_mode}",
+        f"min_maf\t{args.min_maf}",
+        f"min_cell_count\t{args.min_cell_count}",
+        f"spa_mode\t{args.spa_mode}",
+        f"full_refit_p\t{args.full_refit_p}",
+        f"kinship_source\t{kinship.source}",
+        f"tree\t{args.tree or 'NA'}",
+        f"threads\t{args.threads}",
+        "solver_backend\tdense_weighted_eigen_pql",
+        "tau_profile_backend\texact_spectral_coordinates",
+        f"checkpoint_enabled\t{int(checkpoint_enabled)}",
+        f"checkpoint_resumed\t{int(bool(checkpoint and checkpoint.statistics.resumed))}",
+        f"checkpoint_retained\t{int(bool(checkpoint and args.keep_checkpoints))}",
+        f"execution_metadata\t{metadata_path.name}",
+    ]
+    _atomic_text_write(summary_path, "\n".join(summary_lines) + "\n")
+
+    metadata_rows: list[dict[str, object]] = []
+    metadata_rows.extend(_metadata_rows("configuration", {
+        "direction_mode": args.direction_mode,
+        "min_maf": args.min_maf,
+        "min_cell_count": args.min_cell_count,
+        "near_redundant_mismatch": args.near_redundant_mismatch,
+        "exclude_near_redundant": int(args.exclude_near_redundant),
+        "spa_mode": args.spa_mode,
+        "full_refit_p": args.full_refit_p,
+        "null_max_iter": args.null_max_iter,
+        "null_tolerance": args.null_tolerance,
+        "threads": args.threads,
+        "worker_chunk_size": args.worker_chunk_size,
+        "predictor_batch_size": args.predictor_batch_size,
+        "checkpoint_every": args.checkpoint_every,
+    }))
+    metadata_rows.extend(_metadata_rows("runtime", runtime.summary_fields()))
+    metadata_rows.extend(_metadata_rows("memory", memory_estimate.summary_fields()))
+    metadata_rows.extend(_metadata_rows("response_cache", cache_diagnostics))
+    metadata_rows.extend(_metadata_rows("stage_timing", stage_seconds, unit="seconds"))
+    metadata_rows.extend(
+        _metadata_rows("scan_timing", scan_metrics.seconds, unit="seconds")
+    )
+    metadata_rows.extend(_metadata_rows("scan_counts", scan_metrics.counts, unit="count"))
+    metadata_rows.extend(_metadata_rows("kinship", {
+        "rank": kdiag.rank,
+        "eigen_min": kdiag.eigen_min,
+        "eigen_max": kdiag.eigen_max,
+        "roundoff_correction": kdiag.roundoff_correction,
+        "mean_diag_before_norm": kinship.mean_diag_before_norm,
+        "loci_used": kinship.n_loci_used,
+        **{f"detail_{key}": value for key, value in kinship.details.items()},
+    }))
+    if checkpoint is None:
+        metadata_rows.extend(_metadata_rows("checkpoint", {"enabled": 0}))
+    else:
+        metadata_rows.extend(_metadata_rows("checkpoint", checkpoint.metadata_fields()))
+    _atomic_dataframe_write(
+        pd.DataFrame(metadata_rows),
+        metadata_path,
+    )
 
     sys.stderr.write("[KOVAR] result_status_counts\n")
     sys.stderr.write(results["status"].fillna("NA").value_counts().to_string() + "\n")
-    stage_seconds["write_results"] = time.monotonic() - stage_started
-    with (out / "run_summary.txt").open("a", encoding="utf-8") as summary:
-        summary.write(f"stage_seconds_write_results\t{stage_seconds['write_results']:.6f}\n")
-    _step(started, "complete", f"results={result_path} response_models={model_path}")
+    if checkpoint is not None:
+        checkpoint_finalized = checkpoint.complete(cleanup=not args.keep_checkpoints)
+        if not checkpoint_finalized:
+            sys.stderr.write(
+                f"[KOVAR] warning=checkpoint_cleanup_failed directory={checkpoint.root}; "
+                "final outputs are complete and the checkpoint is marked complete\n"
+            )
+            sys.stderr.flush()
+    _step(
+        started,
+        "complete",
+        f"results={result_path} response_models={model_path} metadata={metadata_path}",
+    )
 
 
 if __name__ == "__main__":

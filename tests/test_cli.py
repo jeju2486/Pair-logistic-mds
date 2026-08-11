@@ -23,14 +23,22 @@ class CommandLineContractTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(
             completed.stdout.strip(),
-            {"KOVAR 0.8.1", "KO-Variation 0.8.1"},
+            {"KOVAR 0.8.2", "KO-Variation 0.8.2"},
         )
 
     def test_help_exposes_directional_glmm_options_and_removes_lmm_controls(self) -> None:
         completed = self._run("--help")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         help_text = completed.stdout
-        for option in ("--direction-mode", "--min-maf", "--min-cell-count", "--spa-mode"):
+        for option in (
+            "--direction-mode",
+            "--min-maf",
+            "--min-cell-count",
+            "--spa-mode",
+            "--resume",
+            "--checkpoint-every",
+            "--no-checkpoint",
+        ):
             self.assertIn(option, help_text)
         for removed in ("--h2-max", "--h2-grid-size", "--grm-shrinkage", "--grm-rank", "--pair-test"):
             self.assertNotIn(removed, help_text)
@@ -65,14 +73,31 @@ class CommandLineContractTests(unittest.TestCase):
             results = pd.read_csv(out / "ko_variation.tsv", sep="\t")
             models = pd.read_csv(out / "response_models.tsv", sep="\t")
             summary = (out / "run_summary.txt").read_text(encoding="utf-8")
+            metadata = pd.read_csv(out / "execution_metadata.tsv", sep="\t")
+            checkpoint_exists = (out / ".kovar_checkpoint").exists()
 
         self.assertEqual(results["direction"].tolist(), ["u_predicts_v", "v_predicts_u"])
         self.assertEqual(len(models), 2)
         self.assertIn("model\tdirectional_logistic_mixed_model_pql_score", summary)
         self.assertIn("release_status\texperimental", summary)
         self.assertIn("solver_backend\tdense_weighted_eigen_pql", summary)
-        self.assertIn("runtime_blas_threads\t", summary)
-        self.assertIn("response_pattern_cache\texact_identical_complement", summary)
+        self.assertIn("checkpoint_enabled\t1", summary)
+        self.assertIn("execution_metadata\texecution_metadata.tsv", summary)
+        self.assertFalse(checkpoint_exists)
+        self.assertIn("runtime", set(metadata["category"]))
+        self.assertIn("memory", set(metadata["category"]))
+        self.assertIn("scan_timing", set(metadata["category"]))
+        self.assertIn("checkpoint", set(metadata["category"]))
+        scan_timing_metrics = set(
+            metadata.loc[metadata["category"] == "scan_timing", "metric"]
+        )
+        self.assertIn("directional_table_construction", scan_timing_metrics)
+        self.assertIn("kinship_eigensystem", scan_timing_metrics)
+        self.assertIn("current_compute_weighted_eigendecomposition", scan_timing_metrics)
+        self.assertIn("current_compute_tau_profiling", scan_timing_metrics)
+        self.assertIn("current_compute_score_testing", scan_timing_metrics)
+        self.assertFalse(any(column.startswith("checkpoint_") for column in results.columns))
+        self.assertFalse(any(column.startswith("seconds_") for column in results.columns))
 
 
 if __name__ == "__main__":

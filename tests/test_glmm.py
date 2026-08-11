@@ -324,6 +324,27 @@ class GLMMOptimizationTests(unittest.TestCase):
             atol=1e-9,
         )
 
+    def test_solver_timing_is_reported_without_changing_fit_contract(self) -> None:
+        rng = np.random.default_rng(91)
+        n = 24
+        positions = np.arange(n)
+        kinship = 0.5 ** np.abs(positions[:, None] - positions[None, :])
+        response = np.zeros(n, dtype=np.float64)
+        response[rng.choice(n, size=10, replace=False)] = 1.0
+        timing: dict[str, float] = {}
+
+        fit, cache = fit_null_glmm(
+            1,
+            response,
+            kinship,
+            timing=timing,
+        )
+
+        self.assertEqual(fit.status, "OK")
+        self.assertTrue(cache)
+        self.assertGreater(timing["weighted_eigendecomposition"], 0.0)
+        self.assertGreater(timing["tau_profiling"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

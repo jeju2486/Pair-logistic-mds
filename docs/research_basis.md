@@ -64,13 +64,14 @@ pangenome-wide association studies.** Bioinformatics 34:4310-4312.
 
 pyseer motivates the microbial-GWAS context: clonal population structure,
 pangenome variation, strict sample matching, and tree- or genotype-derived
-relatedness can materially affect association tests. KOVAR 0.8.1 replaces its
-earlier pyseer-like LMM with an experimental binary logistic mixed model.
+relatedness can materially affect association tests. KOVAR 0.8.2 retains the
+experimental binary logistic mixed model that replaced its earlier pyseer-like
+LMM.
 
 ## Related phylogenetic and pangenome methods
 
 These studies inform interpretation but are not algorithms implemented by
-KOVAR 0.8.1:
+KOVAR 0.8.2:
 
 - **Ives AR, Garland T Jr (2010). Phylogenetic Logistic Regression for Binary
   Dependent Variables.** Systematic Biology 59:9-26.

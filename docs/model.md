@@ -1,6 +1,6 @@
-# Statistical model in KOVAR 0.8.1
+# Statistical model in KOVAR 0.8.2
 
-KOVAR 0.8.1 is an **experimental** directional binary-locus association
+KOVAR 0.8.2 is an **experimental** directional binary-locus association
 scanner. It asks whether the state of one locus predicts the state of another
 after accounting for covariance among samples. The result is a
 kinship-adjusted covariation candidate, not proof of a causal or biochemical
@@ -209,7 +209,7 @@ reported result.
 
 ### No scientific shrinkage or rank truncation
 
-Version 0.8.1 does not use the 0.7.0 `h2` cap, identity-shrinkage lambda, or
+Version 0.8.2 does not use the 0.7.0 `h2` cap, identity-shrinkage lambda, or
 low-rank kernel truncation. A finite, symmetric covariance is normalized and
 checked for positive semidefiniteness. Only tiny negative eigenvalues consistent
 with floating-point roundoff are corrected; a materially indefinite matrix is
