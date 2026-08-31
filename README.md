@@ -14,12 +14,7 @@ left for a future separate `ko-variation-annotation` tool.
 
 ```bash
 git clone https://github.com/jeju2486/Pair-logistic-mds.git
-cd Pair-logistic-mds
-git switch agent/replace-with-pair-lmm-gwes
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install .
+pip install -e .
 ko-variation --version
 ```
 
