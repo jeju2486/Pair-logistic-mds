@@ -13,7 +13,6 @@ import pandas as pd
 
 from .checkpoint import CheckpointError, CheckpointStore
 from .glmm import (
-    fit_full_glmm,
     fit_null_glmm,
     neglog10,
     prepare_kinship_eigensystem,
@@ -25,10 +24,9 @@ from .spa import spa_pvalue
 @dataclass
 class ScanConfig:
     min_maf: float = 0.05
-    min_cell_count: int = 5
-    direction_mode: str = "both"  # both or input
-    spa_mode: str = "off"  # off, auto or always
-    full_refit_p: float = 0.05
+    min_cell_count: int = 1
+    graph_count_fraction: float = 0.05
+    spa_mode: str = "auto"  # off, auto or always
     threads: int = 1
     worker_chunk_size: int = 1
     predictor_batch_size: int = 256
@@ -36,8 +34,6 @@ class ScanConfig:
     null_tolerance: float = 1e-7
     progress: bool = True
     progress_every_responses: int = 25
-    near_redundant_mismatch: float = 0.02
-    exclude_near_redundant: bool = False
 
 
 @dataclass
@@ -88,27 +84,16 @@ class _ResponsePatternTask:
     entries: tuple[_ResponseEntry, ...]
 
 
-@dataclass(frozen=True)
-class _FullRefitTask:
-    output_index: int
-    predictor_locus: int
-    response_locus: int
-    base_status: str
-
 _RESERVED_METADATA_COLUMNS = {
     "pair_id", "pair_u", "pair_v", "predictor_locus", "response_locus",
-    "direction", "direction_order", "predictor_prevalence",
+    "predictor_prevalence",
     "response_prevalence", "predictor_maf", "response_maf", "n11", "n10",
-    "n01", "n00", "min_cell", "phi", "r2", "odds_ratio_0.5pc",
-    "same_mismatch_rate", "complement_mismatch_rate", "near_copy",
-    "near_complement", "near_redundant", "status", "eligible",
+    "n01", "n00", "min_cell", "graph_count_threshold", "status", "eligible",
     "tau_phylogenetic", "latent_phylogenetic_fraction", "score_u",
-    "score_variance", "score_z", "p_score", "beta_score", "se_score",
+    "score_variance", "score_chisq", "p_score",
     "spa_applied", "spa_status", "spa_variance_ratio", "p_spa", "p_primary",
-    "primary_method", "score_primary", "full_refit_attempted",
-    "beta_log_odds", "se_log_odds", "odds_ratio", "odds_ratio_ci_low",
-    "odds_ratio_ci_high", "tau_alt", "p_wald", "full_refit_status", "q_bh",
-    "bonferroni_significant", "n_directional_tests", "kinship_source",
+    "primary_method", "neglog10_p", "q_bh",
+    "bonferroni_significant", "n_tests", "kinship_source",
     "kinship_rank", "kinship_eigen_min", "kinship_eigen_max",
     "kinship_roundoff_correction",
     "canonical_response_locus", "response_pattern_id",
@@ -167,37 +152,23 @@ def pair_counts_fast(
     return n11, n10, n01, n00
 
 
-def _safe_phi(n11: int, n10: int, n01: int, n00: int) -> float:
-    denominator = (n11 + n10) * (n01 + n00) * (n11 + n01) * (n10 + n00)
-    if denominator <= 0:
-        return np.nan
-    return float((n11 * n00 - n10 * n01) / math.sqrt(denominator))
-
-
-def _or_half_correction(n11: int, n10: int, n01: int, n00: int) -> float:
-    return float(((n11 + 0.5) * (n00 + 0.5)) / ((n10 + 0.5) * (n01 + 0.5)))
-
-
-def _validate_unique_pairs(pairs: pd.DataFrame, direction_mode: str) -> None:
-    if direction_mode == "both":
-        keys = [tuple(sorted((int(u), int(v)))) for u, v in pairs[["u", "v"]].itertuples(index=False, name=None)]
-    else:
-        keys = [(int(u), int(v)) for u, v in pairs[["u", "v"]].itertuples(index=False, name=None)]
+def _validate_unique_pairs(pairs: pd.DataFrame) -> None:
+    keys = [tuple(sorted((int(u), int(v)))) for u, v in pairs[["u", "v"]].itertuples(index=False, name=None)]
     if len(keys) != len(set(keys)):
-        kind = "unordered" if direction_mode == "both" else "directed"
-        raise ValueError(f"Pair file contains duplicate {kind} pairs; deduplicate before scanning")
+        raise ValueError("Pair file contains duplicate unordered pairs; deduplicate before scanning")
 
 
-def _directional_rows(pairs: pd.DataFrame, X: np.ndarray, config: ScanConfig) -> pd.DataFrame:
-    if config.direction_mode not in {"both", "input"}:
-        raise ValueError("direction_mode must be 'both' or 'input'")
+def _pair_rows(pairs: pd.DataFrame, X: np.ndarray, config: ScanConfig) -> pd.DataFrame:
+    """Build one canonical analysis row per unordered input pair."""
     if config.spa_mode not in {"off", "auto", "always"}:
         raise ValueError("spa_mode must be 'off', 'auto' or 'always'")
     if not (0.0 <= float(config.min_maf) <= 0.5):
         raise ValueError("min_maf must be between 0 and 0.5")
     if int(config.min_cell_count) < 0:
         raise ValueError("min_cell_count must be non-negative")
-    _validate_unique_pairs(pairs, config.direction_mode)
+    if not (0.0 <= float(config.graph_count_fraction) <= 1.0):
+        raise ValueError("graph_count_fraction must be between 0 and 1")
+    _validate_unique_pairs(pairs)
 
     n = X.shape[0]
     sums = X.sum(axis=0).astype(np.int64)
@@ -212,73 +183,48 @@ def _directional_rows(pairs: pd.DataFrame, X: np.ndarray, config: ScanConfig) ->
             + ". Rename these input columns before scanning."
         )
     rows: list[dict[str, Any]] = []
+    graph_threshold = int(math.ceil(float(config.graph_count_fraction) * n))
+    has_graph_count = "count" in pairs.columns
+    graph_counts = (
+        pd.to_numeric(pairs["count"], errors="coerce").to_numpy(dtype=np.float64)
+        if has_graph_count else None
+    )
 
-    for pair_id, pair in pairs.iterrows():
-        u = int(pair["u"])
-        v = int(pair["v"])
+    for row_number, (pair_id, pair) in enumerate(pairs.iterrows()):
+        u, v = sorted((int(pair["u"]), int(pair["v"])))
         base_counts = pair_counts_fast(X, u, v, sums)
         n11, n10_uv, n01_uv, n00 = base_counts
-        same_mismatch = n10_uv + n01_uv
-        complement_mismatch = n11 + n00
-        same_rate = same_mismatch / float(n)
-        complement_rate = complement_mismatch / float(n)
-        near_copy = same_rate <= float(config.near_redundant_mismatch)
-        near_complement = complement_rate <= float(config.near_redundant_mismatch)
-        directions = [(u, v, "u_predicts_v", 0)]
-        if config.direction_mode == "both":
-            directions.append((v, u, "v_predicts_u", 1))
-
-        for predictor, response, direction, direction_order in directions:
-            if predictor == u:
-                counts = (n11, n10_uv, n01_uv, n00)
-            else:
-                counts = (n11, n01_uv, n10_uv, n00)
-            d11, d10, d01, d00 = counts
-            row: dict[str, Any] = {
-                "pair_id": int(pair_id),
-                "u": u,
-                "v": v,
-                "pair_u": u,
-                "pair_v": v,
-                "predictor_locus": int(predictor),
-                "response_locus": int(response),
-                "direction": direction,
-                "direction_order": direction_order,
-            }
-            for column in metadata_columns:
-                row[column] = pair[column]
-            row.update({
-                "predictor_prevalence": float(prevalence[predictor]),
-                "response_prevalence": float(prevalence[response]),
-                "predictor_maf": float(maf[predictor]),
-                "response_maf": float(maf[response]),
-                "n11": d11,
-                "n10": d10,
-                "n01": d01,
-                "n00": d00,
-                "min_cell": int(min(counts)),
-                "phi": _safe_phi(d11, d10, d01, d00),
-                "r2": _safe_phi(d11, d10, d01, d00) ** 2,
-                "odds_ratio_0.5pc": _or_half_correction(d11, d10, d01, d00),
-                "same_mismatch_rate": same_rate,
-                "complement_mismatch_rate": complement_rate,
-                "near_copy": int(near_copy),
-                "near_complement": int(near_complement),
-                "near_redundant": int(near_copy or near_complement),
-            })
-            if maf[predictor] + 1e-12 < float(config.min_maf):
-                status = "LOW_PREDICTOR_MAF"
-            elif maf[response] + 1e-12 < float(config.min_maf):
-                status = "LOW_RESPONSE_MAF"
-            elif min(counts) < int(config.min_cell_count):
-                status = "LOW_CELL_COUNT"
-            elif config.exclude_near_redundant and (near_copy or near_complement):
-                status = "NEAR_REDUNDANT"
-            else:
-                status = "ELIGIBLE"
-            row["status"] = status
-            row["eligible"] = int(status == "ELIGIBLE")
-            rows.append(row)
+        predictor, response = u, v
+        counts = (n11, n10_uv, n01_uv, n00)
+        row: dict[str, Any] = {
+            "pair_id": int(pair_id), "u": u, "v": v, "pair_u": u, "pair_v": v,
+            "predictor_locus": predictor, "response_locus": response,
+        }
+        for column in metadata_columns:
+            row[column] = pair[column]
+        row.update({
+            "predictor_prevalence": float(prevalence[predictor]),
+            "response_prevalence": float(prevalence[response]),
+            "predictor_maf": float(maf[predictor]),
+            "response_maf": float(maf[response]),
+            "n11": n11, "n10": n10_uv, "n01": n01_uv, "n00": n00,
+            "min_cell": int(min(counts)),
+            "graph_count_threshold": graph_threshold if has_graph_count else np.nan,
+        })
+        graph_count = graph_counts[row_number] if graph_counts is not None else np.nan
+        if has_graph_count and (not np.isfinite(graph_count) or float(graph_count) < graph_threshold):
+            status = "LOW_GRAPH_COUNT"
+        elif maf[predictor] + 1e-12 < float(config.min_maf):
+            status = "LOW_U_MAF"
+        elif maf[response] + 1e-12 < float(config.min_maf):
+            status = "LOW_V_MAF"
+        elif min(counts) < int(config.min_cell_count):
+            status = "LOW_CELL_COUNT"
+        else:
+            status = "ELIGIBLE"
+        row["status"] = status
+        row["eligible"] = int(status == "ELIGIBLE")
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -373,26 +319,15 @@ def _empty_inference() -> dict[str, Any]:
         "latent_phylogenetic_fraction": np.nan,
         "score_u": np.nan,
         "score_variance": np.nan,
-        "score_z": np.nan,
+        "score_chisq": np.nan,
         "p_score": np.nan,
-        "beta_score": np.nan,
-        "se_score": np.nan,
         "spa_applied": 0,
         "spa_status": "NOT_APPLIED",
         "spa_variance_ratio": np.nan,
         "p_spa": np.nan,
         "p_primary": np.nan,
         "primary_method": "NONE",
-        "score_primary": np.nan,
-        "full_refit_attempted": 0,
-        "beta_log_odds": np.nan,
-        "se_log_odds": np.nan,
-        "odds_ratio": np.nan,
-        "odds_ratio_ci_low": np.nan,
-        "odds_ratio_ci_high": np.nan,
-        "tau_alt": np.nan,
-        "p_wald": np.nan,
-        "full_refit_status": "NOT_ATTEMPTED",
+        "neglog10_p": np.nan,
     }
 
 
@@ -488,10 +423,8 @@ def _worker_response(
         out.update({
             "score_u": score_sign * score.score_u,
             "score_variance": score.score_variance,
-            "score_z": score_sign * score.score_z,
+            "score_chisq": score.score_z * score.score_z,
             "p_score": score.p_score,
-            "beta_score": score_sign * score.beta_score,
-            "se_score": score.se_score,
         })
         if score.status != "OK":
             out["status"] = score.status
@@ -528,50 +461,10 @@ def _worker_response(
                 out["primary_method"] = "score_normal_spa_failed"
                 out["status"] = "OK_SPA_FAILED"
 
-        out["score_primary"] = neglog10(float(out["p_primary"]))
+        out["neglog10_p"] = neglog10(float(out["p_primary"]))
         updates.append((output_index, out))
     timings["response_task_wall"] = time.perf_counter() - task_started
     return int(task.pattern_id), null_rows, updates, timings
-
-
-def _worker_full_refit(
-    task: _FullRefitTask,
-) -> tuple[int, dict[str, Any], dict[str, float]]:
-    assert _GLOBAL_X is not None and _GLOBAL_K is not None and _GLOBAL_CONFIG is not None
-    started = time.perf_counter()
-    X = _GLOBAL_X
-    config = _GLOBAL_CONFIG
-    solver_timing: dict[str, float] = {}
-    full = fit_full_glmm(
-        X[:, task.response_locus].astype(np.float64, copy=False),
-        X[:, task.predictor_locus],
-        _GLOBAL_K,
-        max_iter=config.null_max_iter,
-        tolerance=config.null_tolerance,
-        kinship_eigensystem=_GLOBAL_KINSHIP_EIGENSYSTEM,
-        timing=solver_timing,
-    )
-    update: dict[str, Any] = {
-        "full_refit_attempted": 1,
-        "beta_log_odds": full.beta,
-        "se_log_odds": full.se,
-        "odds_ratio": full.odds_ratio,
-        "odds_ratio_ci_low": full.ci_low,
-        "odds_ratio_ci_high": full.ci_high,
-        "tau_alt": full.tau,
-        "p_wald": full.wald_p,
-        "full_refit_status": full.status,
-    }
-    if full.status != "OK" and task.base_status == "OK":
-        update["status"] = "OK_REFIT_FAILED"
-    timings = {
-        "full_refit": time.perf_counter() - started,
-        "weighted_eigendecomposition": solver_timing.get(
-            "weighted_eigendecomposition", 0.0
-        ),
-        "tau_profiling": solver_timing.get("tau_profiling", 0.0),
-    }
-    return int(task.output_index), update, timings
 
 
 def _bh_adjust(p_values: np.ndarray) -> np.ndarray:
@@ -595,16 +488,16 @@ def scan_pairs_glmm(
     checkpoint: CheckpointStore | None = None,
     metrics: ScanMetrics | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run directional PQL logistic mixed-model tests for candidate pairs."""
+    """Run one PQL logistic mixed-model score test per unordered pair."""
     metrics = metrics if metrics is not None else ScanMetrics()
     started = time.time()
     total_started = time.perf_counter()
 
     operation_started = time.perf_counter()
-    result = _directional_rows(pairs, X, config)
+    result = _pair_rows(pairs, X, config)
     for key, value in _empty_inference().items():
         result[key] = value
-    metrics.add_seconds("directional_table_construction", time.perf_counter() - operation_started)
+    metrics.add_seconds("pair_table_construction", time.perf_counter() - operation_started)
     eligible_indices = result.index[result["eligible"] == 1].to_numpy(dtype=np.int64)
 
     operation_started = time.perf_counter()
@@ -615,8 +508,10 @@ def scan_pairs_glmm(
     kinship_eigensystem = prepare_kinship_eigensystem(K) if tasks else None
     metrics.add_seconds("kinship_eigensystem", time.perf_counter() - operation_started)
     metrics.add_count("input_pairs", len(pairs))
-    metrics.add_count("directional_rows", len(result))
+    metrics.add_count("pair_rows", len(result))
     metrics.add_count("eligible_rows", len(eligible_indices))
+    for status, count in result["status"].value_counts().items():
+        metrics.add_count(f"prefilter_{str(status).lower()}", int(count))
     metrics.add_count("response_loci", original_response_count)
     metrics.add_count("canonical_response_patterns", len(tasks))
 
@@ -661,7 +556,7 @@ def scan_pairs_glmm(
     ]
     if config.progress:
         sys.stderr.write(
-            f"[{_now()}] glmm_scan_start input_pairs={len(pairs)} directional_rows={len(result)} "
+            f"[{_now()}] glmm_scan_start input_pairs={len(pairs)} pair_rows={len(result)} "
             f"eligible={len(eligible_indices)} responses={original_response_count} "
             f"canonical_response_patterns={len(tasks)} "
             f"reused_response_models={original_response_count-len(tasks)} "
@@ -734,94 +629,6 @@ def scan_pairs_glmm(
         if checkpoint is not None:
             checkpoint.flush("score")
 
-        # Alternative fits are deliberately scheduled as a second stage. This
-        # makes score-stage checkpoints complete and independently resumable.
-        p_primary = pd.to_numeric(result["p_primary"], errors="coerce").to_numpy(
-            dtype=np.float64
-        )
-        refit_mask = (
-            (result["eligible"].to_numpy(dtype=np.int8) == 1)
-            & np.isfinite(p_primary)
-            & (float(config.full_refit_p) > 0)
-            & (p_primary <= float(config.full_refit_p))
-        )
-        full_tasks = [
-            _FullRefitTask(
-                output_index=int(index),
-                predictor_locus=int(result.at[index, "predictor_locus"]),
-                response_locus=int(result.at[index, "response_locus"]),
-                base_status=str(result.at[index, "status"]),
-            )
-            for index in np.flatnonzero(refit_mask)
-        ]
-        expected_full_ids = {task.output_index for task in full_tasks}
-        recovered_full_ids: set[int] = set()
-
-        def apply_full_payload(payload: dict[str, Any], *, recovered: bool) -> None:
-            output_index = int(payload.get("output_index", -1))
-            update = payload.get("update")
-            if output_index not in expected_full_ids or not isinstance(update, dict):
-                raise CheckpointError("Full-refit checkpoint payload is invalid")
-            for key, value in update.items():
-                result.at[output_index, key] = value
-            timings = payload.get("timings", {})
-            if isinstance(timings, dict):
-                metrics.add_worker_timings(timings, recovered=recovered)
-
-        if checkpoint is not None:
-            checkpoint.set_plan("full_refit", len(full_tasks))
-            operation_started = time.perf_counter()
-            for task_id, payload in checkpoint.iter_stage("full_refit"):
-                if task_id not in expected_full_ids:
-                    raise CheckpointError(
-                        f"Checkpoint contains unknown full-refit task {task_id}"
-                    )
-                recovered_full_ids.add(task_id)
-                apply_full_payload(payload, recovered=True)
-            metrics.add_seconds(
-                "checkpoint_full_refit_recovery", time.perf_counter() - operation_started
-            )
-        metrics.add_count("full_refit_tasks", len(full_tasks))
-        metrics.add_count("full_refit_tasks_recovered", len(recovered_full_ids))
-        pending_full_tasks = [
-            task for task in full_tasks if task.output_index not in recovered_full_ids
-        ]
-        full_done = len(recovered_full_ids)
-        if pending_full_tasks:
-            prepare_workers()
-            if pool is None:
-                full_iterator = (_worker_full_refit(task) for task in pending_full_tasks)
-            else:
-                full_iterator = pool.imap_unordered(
-                    _worker_full_refit,
-                    pending_full_tasks,
-                    chunksize=max(1, int(config.worker_chunk_size)),
-                )
-            operation_started = time.perf_counter()
-            for output_index, update, timings in full_iterator:
-                payload = {
-                    "output_index": output_index,
-                    "update": update,
-                    "timings": timings,
-                }
-                apply_full_payload(payload, recovered=False)
-                if checkpoint is not None:
-                    checkpoint.record("full_refit", output_index, payload)
-                full_done += 1
-                metrics.add_count("full_refit_tasks_executed")
-                if config.progress and (
-                    full_done == 1
-                    or full_done == len(full_tasks)
-                    or full_done % max(1, int(config.progress_every_responses)) == 0
-                ):
-                    sys.stderr.write(
-                        f"[{_now()}] glmm_full_refit_progress={full_done}/{len(full_tasks)} "
-                        f"elapsed={time.time()-started:.1f}s\n"
-                    )
-                    sys.stderr.flush()
-            metrics.add_seconds("full_refit_stage_wall", time.perf_counter() - operation_started)
-        if checkpoint is not None:
-            checkpoint.flush("full_refit")
     except BaseException:
         if checkpoint is not None:
             checkpoint.flush_all()
@@ -845,9 +652,19 @@ def scan_pairs_glmm(
         bonferroni[finite] = (primary <= 0.05 / n_tested).astype(np.int8)
     result["q_bh"] = q_values
     result["bonferroni_significant"] = bonferroni
-    result["n_directional_tests"] = n_tested
-    result = result.sort_values(["pair_id", "direction_order"], kind="stable").reset_index(drop=True)
-    result = result.drop(columns=["direction_order"])
+    result["n_tests"] = n_tested
+    result = result.sort_values(["pair_id"], kind="stable").reset_index(drop=True)
+    result = result.drop(columns=[
+        "pair_u", "pair_v", "predictor_locus", "response_locus",
+        "tau_phylogenetic", "latent_phylogenetic_fraction",
+        "score_u", "score_variance",
+    ])
+    result = result.rename(columns={
+        "predictor_prevalence": "u_prevalence",
+        "response_prevalence": "v_prevalence",
+        "predictor_maf": "u_maf",
+        "response_maf": "v_maf",
+    })
     metrics.add_seconds("multiple_testing_and_sort", time.perf_counter() - operation_started)
 
     operation_started = time.perf_counter()

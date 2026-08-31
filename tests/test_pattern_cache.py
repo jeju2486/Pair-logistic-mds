@@ -6,7 +6,7 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 
-from ko_variation.glmm import fit_full_glmm, fit_null_glmm, score_predictor
+from ko_variation.glmm import fit_null_glmm, score_predictor
 from ko_variation.scan import (
     ScanConfig,
     _canonical_response_pattern,
@@ -56,9 +56,7 @@ class ResponsePatternCacheTests(unittest.TestCase):
         )
         config = ScanConfig(
             progress=False,
-            direction_mode="input",
             spa_mode="off",
-            full_refit_p=0,
         )
 
         with mock.patch(
@@ -70,7 +68,7 @@ class ResponsePatternCacheTests(unittest.TestCase):
         self.assertEqual(fit_spy.call_count, 1)
         self.assertIsNotNone(fit_spy.call_args.kwargs["kinship_eigensystem"])
         self.assertEqual(len(cached), 3)
-        self.assertEqual(cached["response_locus"].tolist(), [1, 2, 3])
+        self.assertEqual(cached["v"].tolist(), [1, 2, 3])
         self.assertEqual(len(response_models), 3)
         self.assertEqual(response_models["response_pattern_id"].nunique(), 1)
         self.assertEqual(response_models["response_pattern_size"].tolist(), [3, 3, 3])
@@ -93,71 +91,13 @@ class ResponsePatternCacheTests(unittest.TestCase):
             self.assertEqual(fit.status, "OK")
             self.assertEqual(cached.loc[result_index, "status"], "OK")
             self.assertAlmostEqual(
-                cached.loc[result_index, "tau_phylogenetic"], fit.tau, places=9
-            )
-            self.assertAlmostEqual(
-                cached.loc[result_index, "score_u"], separate.score_u, places=10
-            )
-            self.assertAlmostEqual(
-                cached.loc[result_index, "score_variance"],
-                separate.score_variance,
-                places=10,
-            )
-            self.assertAlmostEqual(
-                cached.loc[result_index, "score_z"], separate.score_z, places=10
-            )
-            self.assertAlmostEqual(
-                cached.loc[result_index, "beta_score"], separate.beta_score, places=10
+                cached.loc[result_index, "score_chisq"], separate.score_z ** 2, places=10
             )
             self.assertAlmostEqual(
                 cached.loc[result_index, "p_primary"], separate.p_score, places=10
             )
 
-    def test_complement_full_refits_use_the_original_response_orientation(self) -> None:
-        matrix = _copy_and_complement_matrix()
-        pairs = pd.DataFrame({"u": [0, 0], "v": [1, 3]})
-        kinship = np.zeros((matrix.shape[0], matrix.shape[0]), dtype=np.float64)
-        config = ScanConfig(
-            progress=False,
-            direction_mode="input",
-            spa_mode="off",
-            full_refit_p=1.0,
-        )
-
-        with mock.patch(
-            "ko_variation.scan.fit_null_glmm",
-            wraps=fit_null_glmm,
-        ) as null_spy, mock.patch(
-            "ko_variation.scan.fit_full_glmm",
-            wraps=fit_full_glmm,
-        ) as full_spy:
-            cached, _ = scan_pairs_glmm(pairs, matrix, kinship, config)
-
-        self.assertEqual(null_spy.call_count, 1)
-        self.assertEqual(full_spy.call_count, 2)
-        self.assertTrue(np.all(cached["full_refit_attempted"] == 1))
-        for result_index, response_locus in enumerate([1, 3]):
-            separate = fit_full_glmm(
-                matrix[:, response_locus],
-                matrix[:, 0],
-                kinship,
-            )
-            self.assertEqual(separate.status, "OK")
-            self.assertEqual(cached.loc[result_index, "full_refit_status"], "OK")
-            self.assertAlmostEqual(
-                cached.loc[result_index, "beta_log_odds"], separate.beta, places=11
-            )
-            self.assertAlmostEqual(
-                cached.loc[result_index, "se_log_odds"], separate.se, places=11
-            )
-            self.assertAlmostEqual(
-                cached.loc[result_index, "odds_ratio"], separate.odds_ratio, places=11
-            )
-            self.assertAlmostEqual(
-                cached.loc[result_index, "p_wald"], separate.wald_p, places=13
-            )
-
-    def test_spa_is_complement_invariant_while_directional_scores_change_sign(self) -> None:
+    def test_spa_is_complement_invariant(self) -> None:
         matrix = _copy_and_complement_matrix()
         pairs = pd.DataFrame({"u": [0, 0], "v": [1, 3]})
         kinship = np.zeros((matrix.shape[0], matrix.shape[0]), dtype=np.float64)
@@ -168,21 +108,12 @@ class ResponsePatternCacheTests(unittest.TestCase):
             kinship,
             ScanConfig(
                 progress=False,
-                direction_mode="input",
                 spa_mode="always",
-                full_refit_p=0,
             ),
         )
 
         self.assertEqual(cached["spa_status"].tolist(), ["OK", "OK"])
-        self.assertAlmostEqual(cached.loc[0, "score_u"], -cached.loc[1, "score_u"], places=12)
-        self.assertAlmostEqual(cached.loc[0, "score_z"], -cached.loc[1, "score_z"], places=12)
-        self.assertAlmostEqual(
-            cached.loc[0, "beta_score"], -cached.loc[1, "beta_score"], places=12
-        )
-        self.assertAlmostEqual(
-            cached.loc[0, "score_variance"], cached.loc[1, "score_variance"], places=12
-        )
+        self.assertAlmostEqual(cached.loc[0, "score_chisq"], cached.loc[1, "score_chisq"], places=12)
         self.assertAlmostEqual(cached.loc[0, "p_score"], cached.loc[1, "p_score"], places=14)
         self.assertAlmostEqual(cached.loc[0, "p_spa"], cached.loc[1, "p_spa"], places=14)
         self.assertAlmostEqual(

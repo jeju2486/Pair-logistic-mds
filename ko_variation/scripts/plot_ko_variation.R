@@ -23,7 +23,7 @@ parse_args <- function() {
   args <- commandArgs(trailingOnly = TRUE)
   o <- list(
     score = NULL, out = NULL,
-    y_col = "score_primary",
+    y_col = "neglog10_p",
     threshold = NA_real_, alpha = 0.05,
     top_out = NA_character_,
     pairs = NA_character_, n_samples = NA_real_, pair_count_col = "count", pair_count_frac = 0.05, pair_count_min = NA_real_,
@@ -279,8 +279,8 @@ xb <- axis_breaks(plot_dt$plot_x); xmax <- max(xb)
 ymax <- max(plot_dt$plot_y, na.rm=TRUE); if (!is.finite(ymax) || ymax <= 0) ymax <- 1
 ylim <- c(0, ymax*1.05); yticks <- pretty(ylim, n=8)
 
-if (is.na(o$title) || !nzchar(o$title)) o$title <- "KOVAR directional pangenome covariation"
-ylab <- if (o$y_col == "score_primary") "Directional -log10(primary p-value)" else o$y_col
+if (is.na(o$title) || !nzchar(o$title)) o$title <- "KOVAR pangenome covariation"
+ylab <- if (o$y_col == "neglog10_p") "-log10(primary p-value)" else o$y_col
 
 
 sidecar_svg_path <- function(path) {
@@ -345,7 +345,7 @@ if (use_gg) {
     theme(legend.position="none", plot.margin=margin(8,12,8,8), plot.title=element_text(size=19), axis.title=element_text(size=16), axis.text=element_text(size=12)) +
     annotate("text", x=xmax*0.98, y=ylim[1]+0.94*diff(ylim), label=paste0("#Score rows: ", floor(nrow(dt)/1000), "K"), hjust=1, size=5.0) +
     annotate("text", x=xmax*0.98, y=ylim[1]+0.90*diff(ylim), label=paste0("#Threshold: ", sprintf("%.2f", o$threshold)), hjust=1, size=5.0) +
-    annotate("text", x=xmax*0.98, y=ylim[1]+0.86*diff(ylim), label=paste0("#Significant directions: ", nrow(hits)), hjust=1, size=5.0)
+    annotate("text", x=xmax*0.98, y=ylim[1]+0.86*diff(ylim), label=paste0("#Significant pairs: ", nrow(hits)), hjust=1, size=5.0)
   save_gg_all(p, o$out, o$width, o$height, o$dpi, o$write_svg)
 } else {
   open_base_device(o$out, o$width, o$height, o$dpi)

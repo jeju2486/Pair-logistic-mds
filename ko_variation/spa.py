@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Optional saddlepoint calibration for directional KOVAR score tests.
+"""Optional saddlepoint calibration for KOVAR score tests.
 
 This module implements a Lugannani-Rice approximation for a weighted centred
 Bernoulli score.  When the mixed-model variance differs from the conditional

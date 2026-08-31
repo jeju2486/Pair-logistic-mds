@@ -25,38 +25,23 @@ from . import __version__
 from .checkpoint import CheckpointError, CheckpointStore, fingerprint_inputs
 from .glmm import prepare_kinship
 from .io_utils import read_fake_fasta, read_pairs, validate_pairs
-from .kinship import build_background_grm, build_tree_covariance
+from .kinship import build_tree_covariance
 from .scan import ScanConfig, ScanMetrics, scan_pairs_glmm
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "KOVAR: experimental directional covariation scanning with a "
-            "phylogeny-adjusted logistic mixed model. Each candidate pair is "
-            "tested as predictor->response; this direction is predictive, not causal."
+            "KOVAR: unordered pangenome covariation scanning with a "
+            "phylogeny-adjusted logistic mixed-model score test."
         )
     )
-    parser.add_argument("--fasta", required=True, help="Binary fake FASTA; A=0 and C=1 by default.")
+    parser.add_argument("--fasta", required=True, help="Binary fake FASTA with A=0 and C=1.")
     parser.add_argument("--pairs", required=True, help="Zero-based candidate-locus pairs (u and v columns).")
+    parser.add_argument("--tree", required=True, help="Rooted Newick tree with branch lengths.")
     parser.add_argument("--out", required=True, help="Output directory.")
-    parser.add_argument("--tree", help="Preferred: rooted Newick tree with branch lengths.")
-    parser.add_argument(
-        "--tree-missing-length",
-        choices=["error", "one", "zero"],
-        default="error",
-        help="Handling for missing tree branch lengths [error].",
-    )
 
     input_group = parser.add_argument_group("input and filtering")
-    input_group.add_argument("--presence-char", default="C", help="Presence state in fake FASTA [C].")
-    input_group.add_argument("--absence-char", default="A", help="Absence state in fake FASTA [A].")
-    input_group.add_argument(
-        "--drop-invalid-pairs",
-        action="store_true",
-        help="Drop self/out-of-range pairs instead of stopping.",
-    )
-    input_group.add_argument("--max-pairs", type=int, default=0, help="Debugging limit; 0 scans all pairs [0].")
     input_group.add_argument(
         "--min-maf",
         type=float,
@@ -66,69 +51,18 @@ def parse_args(argv=None):
     input_group.add_argument(
         "--min-cell-count",
         type=int,
-        default=5,
-        help="Minimum count in each oriented 2x2 table cell [5].",
-    )
-    input_group.add_argument(
-        "--near-redundant-mismatch",
-        type=float,
-        default=0.02,
-        help="Same/complement mismatch rate used to annotate near-redundant pairs [0.02].",
-    )
-    input_group.add_argument(
-        "--exclude-near-redundant",
-        action="store_true",
-        help="Filter annotated near-copy or near-complement pairs.",
+        default=1,
+        help="Minimum count in each 2x2 table cell [1].",
     )
 
-    model_group = parser.add_argument_group("directional logistic mixed model")
-    model_group.add_argument(
-        "--direction-mode",
-        choices=["both", "input"],
-        default="both",
-        help="Test both directions or only u_predicts_v [both].",
-    )
+    model_group = parser.add_argument_group("logistic mixed model")
     model_group.add_argument(
         "--spa-mode",
         choices=["off", "auto", "always"],
-        default="off",
-        help="Experimental saddlepoint calibration [off]. Not a SAIGE reproduction.",
+        default="auto",
+        help="Saddlepoint calibration policy [auto]. Not a SAIGE reproduction.",
     )
-    model_group.add_argument(
-        "--full-refit-p",
-        type=float,
-        default=0.05,
-        help="Refit a full mixed model for effects when primary p <= threshold; 0 disables [0.05].",
-    )
-    model_group.add_argument("--null-max-iter", type=int, default=100, help="Maximum PQL iterations [100].")
-    model_group.add_argument("--null-tolerance", type=float, default=1e-7, help="PQL convergence tolerance [1e-7].")
     model_group.add_argument("--threads", type=int, default=1, help="Response-wise worker processes [1].")
-    model_group.add_argument("--worker-chunk-size", type=int, default=1, help="Worker scheduling chunk size [1].")
-    model_group.add_argument(
-        "--predictor-batch-size",
-        type=int,
-        default=256,
-        help="Predictors sharing a response scored per matrix block [256].",
-    )
-
-    grm_group = parser.add_argument_group("background GRM fallback (used only without --tree)")
-    grm_group.add_argument("--kinship-min-mac", type=int, default=2, help="Background-locus minimum minor count [2].")
-    grm_group.add_argument("--kinship-chunk-size", type=int, default=4096, help="GRM construction locus chunk [4096].")
-    grm_group.add_argument("--kinship-dtype", choices=["float64", "float32"], default="float64", help="Stored covariance dtype [float64].")
-    grm_group.add_argument(
-        "--grm-proxy-r2",
-        type=float,
-        default=0.8,
-        help="Exclude background loci with raw r2 to any tested locus >= threshold [0.8].",
-    )
-    grm_group.add_argument(
-        "--grm-proxy-mismatch",
-        type=float,
-        default=0.02,
-        help="Exclude same/complement tested-locus proxies at this mismatch rate [0.02].",
-    )
-    grm_group.add_argument("--grm-target-chunk-size", type=int, default=256, help="Proxy-mask target chunk [256].")
-    grm_group.add_argument("--grm-locus-chunk-size", type=int, default=2048, help="Proxy-mask background chunk [2048].")
 
     output_group = parser.add_argument_group("execution and output")
     output_group.add_argument("--no-progress", action="store_true", help="Suppress progress messages.")
@@ -138,25 +72,9 @@ def parse_args(argv=None):
         help="Checkpoint directory [OUT/.kovar_checkpoint].",
     )
     output_group.add_argument(
-        "--checkpoint-every",
-        type=int,
-        default=100,
-        help="Atomically checkpoint after this many completed tasks [100].",
-    )
-    output_group.add_argument(
         "--resume",
         action="store_true",
         help="Resume an exactly matching checkpoint.",
-    )
-    output_group.add_argument(
-        "--no-checkpoint",
-        action="store_true",
-        help="Disable checkpoint writing for this run.",
-    )
-    output_group.add_argument(
-        "--keep-checkpoints",
-        action="store_true",
-        help="Keep checkpoint shards after final outputs are written.",
     )
     output_group.add_argument("--version", action="version", version=f"KO-Variation {__version__}")
     args = parser.parse_args(argv)
@@ -165,22 +83,17 @@ def parse_args(argv=None):
         parser.error("--min-maf must be between 0 and 0.5")
     if args.min_cell_count < 0:
         parser.error("--min-cell-count must be non-negative")
-    if args.threads < 1 or args.worker_chunk_size < 1 or args.predictor_batch_size < 1:
-        parser.error("--threads, --worker-chunk-size and --predictor-batch-size must be positive")
-    if args.null_max_iter < 2 or args.null_tolerance <= 0:
-        parser.error("--null-max-iter must be at least 2 and --null-tolerance must be positive")
-    if not 0.0 <= args.full_refit_p <= 1.0:
-        parser.error("--full-refit-p must be between 0 and 1")
-    if not 0.0 <= args.grm_proxy_r2 <= 1.0:
-        parser.error("--grm-proxy-r2 must be between 0 and 1")
-    if not 0.0 <= args.grm_proxy_mismatch <= 1.0:
-        parser.error("--grm-proxy-mismatch must be between 0 and 1")
-    if args.checkpoint_every < 1:
-        parser.error("--checkpoint-every must be positive")
-    if args.resume and args.no_checkpoint:
-        parser.error("--resume cannot be combined with --no-checkpoint")
-    if args.keep_checkpoints and args.no_checkpoint:
-        parser.error("--keep-checkpoints cannot be combined with --no-checkpoint")
+    if args.threads < 1:
+        parser.error("--threads must be positive")
+    # Numerical and checkpoint tuning are intentionally internal in 0.8.3.
+    args.presence_char = "C"
+    args.absence_char = "A"
+    args.tree_missing_length = "error"
+    args.null_max_iter = 100
+    args.null_tolerance = 1e-7
+    args.worker_chunk_size = 1
+    args.predictor_batch_size = 256
+    args.checkpoint_every = 100
     return args
 
 
@@ -238,28 +151,15 @@ def _checkpoint_identity(
             "blas_libraries": blas_libraries,
         },
         "settings": {
-            "presence_char": args.presence_char,
-            "absence_char": args.absence_char,
-            "drop_invalid_pairs": bool(args.drop_invalid_pairs),
-            "max_pairs": args.max_pairs,
+            "binary_encoding": "A=0,C=1",
             "tree_missing_length": args.tree_missing_length,
             "min_maf": args.min_maf,
             "min_cell_count": args.min_cell_count,
-            "near_redundant_mismatch": args.near_redundant_mismatch,
-            "exclude_near_redundant": bool(args.exclude_near_redundant),
-            "direction_mode": args.direction_mode,
+            "graph_count_fraction": 0.05,
             "spa_mode": args.spa_mode,
-            "full_refit_p": args.full_refit_p,
             "null_max_iter": args.null_max_iter,
             "null_tolerance": args.null_tolerance,
             "predictor_batch_size": args.predictor_batch_size,
-            "kinship_min_mac": args.kinship_min_mac,
-            "kinship_chunk_size": args.kinship_chunk_size,
-            "kinship_dtype": args.kinship_dtype,
-            "grm_proxy_r2": args.grm_proxy_r2,
-            "grm_proxy_mismatch": args.grm_proxy_mismatch,
-            "grm_target_chunk_size": args.grm_target_chunk_size,
-            "grm_locus_chunk_size": args.grm_locus_chunk_size,
         },
     }
 
@@ -323,39 +223,21 @@ def main(argv=None):
     pairs = validate_pairs(
         read_pairs(args.pairs),
         n_loci=n_loci,
-        drop_invalid=args.drop_invalid_pairs,
+        drop_invalid=False,
     )
-    if args.max_pairs > 0:
-        pairs = pairs.iloc[:args.max_pairs].copy().reset_index(drop=True)
     if pairs.empty:
         raise SystemExit("No candidate pairs remain after input validation")
     stage_seconds["read_pairs"] = time.monotonic() - stage_started
     _step(started, "read_pairs", f"pairs={len(pairs)}")
 
-    targets = np.unique(pairs[["u", "v"]].to_numpy(dtype=np.int64).reshape(-1))
     stage_started = time.monotonic()
-    if args.tree:
-        _step(started, "build_covariance", "source=tree")
-        kinship = build_tree_covariance(
-            args.tree,
-            fasta.sample_names,
-            dtype=args.kinship_dtype,
-            missing_length=args.tree_missing_length,
-        )
-    else:
-        _step(started, "build_covariance", "source=background_grm")
-        kinship = build_background_grm(
-            X,
-            targets,
-            min_mac=args.kinship_min_mac,
-            chunk_size=args.kinship_chunk_size,
-            dtype=args.kinship_dtype,
-            progress=progress,
-            mask_r2=args.grm_proxy_r2,
-            mask_mismatch=args.grm_proxy_mismatch,
-            mask_target_chunk_size=args.grm_target_chunk_size,
-            mask_grm_chunk_size=args.grm_locus_chunk_size,
-        )
+    _step(started, "build_covariance", "source=tree")
+    kinship = build_tree_covariance(
+        args.tree,
+        fasta.sample_names,
+        dtype="float64",
+        missing_length=args.tree_missing_length,
+    )
     K, kdiag = prepare_kinship(kinship.K)
     del kinship.K
     stage_seconds["build_covariance"] = time.monotonic() - stage_started
@@ -389,76 +271,50 @@ def main(argv=None):
         )
     sys.stderr.flush()
 
-    checkpoint: CheckpointStore | None = None
-    if not args.no_checkpoint:
-        stage_started = time.monotonic()
-        _step(started, "checkpoint_fingerprint")
-        fingerprint_sources: list[tuple[str, str]] = [
-            ("fasta", args.fasta),
-            ("pairs", args.pairs),
-        ]
-        if args.tree:
-            fingerprint_sources.append(("tree", args.tree))
-        try:
-            input_fingerprints = fingerprint_inputs(fingerprint_sources)
-            identity = _checkpoint_identity(
-                args,
-                input_fingerprints=input_fingerprints,
-                n_samples=n_samples,
-                n_loci=n_loci,
-                n_pairs=len(pairs),
-                blas_libraries=str(
-                    runtime.summary_fields().get("runtime_blas_libraries", "unresolved")
-                ),
-            )
-            checkpoint_path = (
-                Path(args.checkpoint_dir)
-                if args.checkpoint_dir
-                else out / ".kovar_checkpoint"
-            )
-            resolved_checkpoint = checkpoint_path.resolve()
-            resolved_out = out.resolve()
-            if resolved_checkpoint == resolved_out or resolved_out.is_relative_to(
-                resolved_checkpoint
-            ):
-                raise CheckpointError(
-                    "Checkpoint directory must not be the output directory or one of its parents"
-                )
-            checkpoint = CheckpointStore(
-                checkpoint_path,
-                identity,
-                tool_version=__version__,
-                every=args.checkpoint_every,
-                resume=args.resume,
-            )
-        except CheckpointError as exc:
-            raise SystemExit(f"Checkpoint error: {exc}") from exc
-        stage_seconds["checkpoint_fingerprint"] = time.monotonic() - stage_started
-        _step(
-            started,
-            "checkpoint_fingerprint",
-            f"resume={int(args.resume)} directory={checkpoint.root}",
+    stage_started = time.monotonic()
+    _step(started, "checkpoint_fingerprint")
+    try:
+        input_fingerprints = fingerprint_inputs([
+            ("fasta", args.fasta), ("pairs", args.pairs), ("tree", args.tree)
+        ])
+        identity = _checkpoint_identity(
+            args,
+            input_fingerprints=input_fingerprints,
+            n_samples=n_samples,
+            n_loci=n_loci,
+            n_pairs=len(pairs),
+            blas_libraries=str(runtime.summary_fields().get("runtime_blas_libraries", "unresolved")),
         )
+        checkpoint_path = Path(args.checkpoint_dir) if args.checkpoint_dir else out / ".kovar_checkpoint"
+        resolved_checkpoint = checkpoint_path.resolve()
+        resolved_out = out.resolve()
+        if resolved_checkpoint == resolved_out or resolved_out.is_relative_to(resolved_checkpoint):
+            raise CheckpointError("Checkpoint directory must not be the output directory or one of its parents")
+        checkpoint = CheckpointStore(
+            checkpoint_path, identity, tool_version=__version__,
+            every=args.checkpoint_every, resume=args.resume,
+        )
+    except CheckpointError as exc:
+        raise SystemExit(f"Checkpoint error: {exc}") from exc
+    stage_seconds["checkpoint_fingerprint"] = time.monotonic() - stage_started
+    _step(started, "checkpoint_fingerprint", f"resume={int(args.resume)} directory={checkpoint.root}")
 
     config = ScanConfig(
         min_maf=args.min_maf,
         min_cell_count=args.min_cell_count,
-        direction_mode=args.direction_mode,
+        graph_count_fraction=0.05,
         spa_mode=args.spa_mode,
-        full_refit_p=args.full_refit_p,
         threads=args.threads,
         worker_chunk_size=args.worker_chunk_size,
         predictor_batch_size=args.predictor_batch_size,
         null_max_iter=args.null_max_iter,
         null_tolerance=args.null_tolerance,
         progress=progress,
-        near_redundant_mismatch=args.near_redundant_mismatch,
-        exclude_near_redundant=args.exclude_near_redundant,
     )
     _step(
         started,
-        "directional_scan",
-        f"direction_mode={args.direction_mode} min_maf={args.min_maf:g} "
+        "pair_scan",
+        f"unordered=1 min_maf={args.min_maf:g} graph_count_fraction=0.05 "
         f"min_cell_count={args.min_cell_count} spa={args.spa_mode}",
     )
     scan_metrics = ScanMetrics()
@@ -474,7 +330,7 @@ def main(argv=None):
         )
     except CheckpointError as exc:
         raise SystemExit(f"Checkpoint error: {exc}") from exc
-    stage_seconds["directional_scan"] = time.monotonic() - stage_started
+    stage_seconds["pair_scan"] = time.monotonic() - stage_started
 
     cache_diagnostics: dict[str, object] = {
         "response_pattern_cache": "exact_identical_complement",
@@ -503,26 +359,15 @@ def main(argv=None):
         )
         _step(
             started,
-            "directional_scan",
-            f"duration={stage_seconds['directional_scan']:.1f}s "
+            "pair_scan",
+            f"duration={stage_seconds['pair_scan']:.1f}s "
             f"responses={len(response_models)} "
             f"unique_patterns={cache_diagnostics['n_unique_response_patterns']} "
             f"null_fits_reused={cache_diagnostics['n_null_glmm_reused']}",
         )
     else:
         cache_diagnostics["response_pattern_cache"] = "unavailable"
-        _step(started, "directional_scan", f"duration={stage_seconds['directional_scan']:.1f}s")
-
-    shared_diagnostics = {
-        "kinship_source": kinship.source,
-        "kinship_rank": kdiag.rank,
-        "kinship_eigen_min": kdiag.eigen_min,
-        "kinship_eigen_max": kdiag.eigen_max,
-        "kinship_roundoff_correction": kdiag.roundoff_correction,
-    }
-    for column, value in shared_diagnostics.items():
-        results[column] = value
-        response_models[column] = value
+        _step(started, "pair_scan", f"duration={stage_seconds['pair_scan']:.1f}s")
 
     stage_started = time.monotonic()
     _step(started, "write_results")
@@ -535,45 +380,42 @@ def main(argv=None):
     stage_seconds["write_primary_outputs"] = time.monotonic() - stage_started
     tested = int(np.isfinite(results["p_primary"].to_numpy(dtype=np.float64)).sum())
 
-    checkpoint_enabled = checkpoint is not None
     summary_lines = [
         f"version\t{__version__}",
         "tool\tKO-Variation",
         "acronym\tKOVAR",
         "release_status\texperimental",
-        "model\tdirectional_logistic_mixed_model_pql_score",
-        "interpretation\tdirectional_covariation_not_causal_direction",
+        "model\tunordered_logistic_mixed_model_pql_score",
+        "interpretation\tphylogeny_adjusted_covariation_significance_not_effect_size",
         f"n_samples\t{n_samples}",
         f"n_loci\t{n_loci}",
         f"n_input_pairs\t{len(pairs)}",
-        f"n_directional_rows\t{len(results)}",
-        f"n_directional_tests\t{tested}",
-        f"direction_mode\t{args.direction_mode}",
+        f"n_pair_rows\t{len(results)}",
+        f"n_tests\t{tested}",
+        "unordered_pairs\t1",
+        "graph_count_fraction\t0.05",
         f"min_maf\t{args.min_maf}",
         f"min_cell_count\t{args.min_cell_count}",
         f"spa_mode\t{args.spa_mode}",
-        f"full_refit_p\t{args.full_refit_p}",
         f"kinship_source\t{kinship.source}",
-        f"tree\t{args.tree or 'NA'}",
+        f"tree\t{args.tree}",
         f"threads\t{args.threads}",
         "solver_backend\tdense_weighted_eigen_pql",
         "tau_profile_backend\texact_spectral_coordinates",
-        f"checkpoint_enabled\t{int(checkpoint_enabled)}",
-        f"checkpoint_resumed\t{int(bool(checkpoint and checkpoint.statistics.resumed))}",
-        f"checkpoint_retained\t{int(bool(checkpoint and args.keep_checkpoints))}",
+        "checkpoint_enabled\t1",
+        f"checkpoint_resumed\t{int(checkpoint.statistics.resumed)}",
+        "checkpoint_retained\t0",
         f"execution_metadata\t{metadata_path.name}",
     ]
     _atomic_text_write(summary_path, "\n".join(summary_lines) + "\n")
 
     metadata_rows: list[dict[str, object]] = []
     metadata_rows.extend(_metadata_rows("configuration", {
-        "direction_mode": args.direction_mode,
+        "unordered_pairs": 1,
+        "graph_count_fraction": 0.05,
         "min_maf": args.min_maf,
         "min_cell_count": args.min_cell_count,
-        "near_redundant_mismatch": args.near_redundant_mismatch,
-        "exclude_near_redundant": int(args.exclude_near_redundant),
         "spa_mode": args.spa_mode,
-        "full_refit_p": args.full_refit_p,
         "null_max_iter": args.null_max_iter,
         "null_tolerance": args.null_tolerance,
         "threads": args.threads,
@@ -598,10 +440,7 @@ def main(argv=None):
         "loci_used": kinship.n_loci_used,
         **{f"detail_{key}": value for key, value in kinship.details.items()},
     }))
-    if checkpoint is None:
-        metadata_rows.extend(_metadata_rows("checkpoint", {"enabled": 0}))
-    else:
-        metadata_rows.extend(_metadata_rows("checkpoint", checkpoint.metadata_fields()))
+    metadata_rows.extend(_metadata_rows("checkpoint", checkpoint.metadata_fields()))
     _atomic_dataframe_write(
         pd.DataFrame(metadata_rows),
         metadata_path,
@@ -609,14 +448,13 @@ def main(argv=None):
 
     sys.stderr.write("[KOVAR] result_status_counts\n")
     sys.stderr.write(results["status"].fillna("NA").value_counts().to_string() + "\n")
-    if checkpoint is not None:
-        checkpoint_finalized = checkpoint.complete(cleanup=not args.keep_checkpoints)
-        if not checkpoint_finalized:
-            sys.stderr.write(
-                f"[KOVAR] warning=checkpoint_cleanup_failed directory={checkpoint.root}; "
-                "final outputs are complete and the checkpoint is marked complete\n"
-            )
-            sys.stderr.flush()
+    checkpoint_finalized = checkpoint.complete(cleanup=True)
+    if not checkpoint_finalized:
+        sys.stderr.write(
+            f"[KOVAR] warning=checkpoint_cleanup_failed directory={checkpoint.root}; "
+            "final outputs are complete and the checkpoint is marked complete\n"
+        )
+        sys.stderr.flush()
     _step(
         started,
         "complete",

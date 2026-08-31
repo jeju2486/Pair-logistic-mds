@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 
 from ko_variation.glmm import prepare_kinship
-from ko_variation.kinship import build_background_grm, build_tree_covariance
+from ko_variation.kinship import build_tree_covariance
 
 
 class KinshipTests(unittest.TestCase):
@@ -51,23 +51,6 @@ class KinshipTests(unittest.TestCase):
     def test_prepare_kinship_rejects_materially_indefinite_matrix(self) -> None:
         with self.assertRaisesRegex(ValueError, "positive semidefinite"):
             prepare_kinship(np.array([[1.0, 2.0], [2.0, 1.0]], dtype=np.float64))
-
-    def test_background_grm_masks_tested_loci_and_remains_psd(self) -> None:
-        rng = np.random.default_rng(42)
-        matrix = rng.binomial(1, 0.35, size=(100, 24)).astype(np.uint8)
-        result = build_background_grm(
-            matrix,
-            target_loci=np.array([0, 1]),
-            min_mac=2,
-            progress=False,
-        )
-        prepared, diagnostics = prepare_kinship(result.K)
-
-        self.assertEqual(result.details["n_direct_masked"], 2)
-        self.assertGreater(result.n_loci_used, 0)
-        self.assertAlmostEqual(float(np.mean(np.diag(prepared))), 1.0, places=12)
-        self.assertGreaterEqual(diagnostics.eigen_min, -1e-12)
-
 
 if __name__ == "__main__":
     unittest.main()

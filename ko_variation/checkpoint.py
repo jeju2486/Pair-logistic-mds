@@ -16,8 +16,8 @@ from typing import Any, Iterable, Iterator, Mapping
 import numpy as np
 
 
-CHECKPOINT_SCHEMA_VERSION = 1
-_STAGES = ("score", "full_refit")
+CHECKPOINT_SCHEMA_VERSION = 2
+_STAGES = ("score",)
 
 
 class CheckpointError(ValueError):
@@ -92,9 +92,7 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 class CheckpointStatistics:
     resumed: bool = False
     recovered_score_tasks: int = 0
-    recovered_full_refit_tasks: int = 0
     written_score_tasks: int = 0
-    written_full_refit_tasks: int = 0
     shards_read: int = 0
     shards_written: int = 0
     bytes_read: int = 0
@@ -106,9 +104,7 @@ class CheckpointStatistics:
         return {
             "resumed": int(self.resumed),
             "recovered_score_tasks": self.recovered_score_tasks,
-            "recovered_full_refit_tasks": self.recovered_full_refit_tasks,
             "written_score_tasks": self.written_score_tasks,
-            "written_full_refit_tasks": self.written_full_refit_tasks,
             "shards_read": self.shards_read,
             "shards_written": self.shards_written,
             "bytes_read": self.bytes_read,
@@ -276,10 +272,7 @@ class CheckpointStore:
                         f"Checkpoint contains duplicate {stage} task {task_id}"
                     )
                 seen.add(task_id)
-                if stage == "score":
-                    self.statistics.recovered_score_tasks += 1
-                else:
-                    self.statistics.recovered_full_refit_tasks += 1
+                self.statistics.recovered_score_tasks += 1
                 payload = record.get("payload")
                 if not isinstance(payload, dict):
                     raise CheckpointError(
@@ -332,10 +325,7 @@ class CheckpointStore:
             }
         )
         self._write_manifest()
-        if stage == "score":
-            self.statistics.written_score_tasks += len(records)
-        else:
-            self.statistics.written_full_refit_tasks += len(records)
+        self.statistics.written_score_tasks += len(records)
         self.statistics.shards_written += 1
         self.statistics.bytes_written += len(compressed)
         self.statistics.write_seconds += time.perf_counter() - started

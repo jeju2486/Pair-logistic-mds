@@ -77,21 +77,6 @@ class ScoreResult:
     adjusted_predictor: np.ndarray | None = None
 
 
-@dataclass
-class FullFitResult:
-    status: str
-    attempted: bool = True
-    beta: float = np.nan
-    se: float = np.nan
-    odds_ratio: float = np.nan
-    ci_low: float = np.nan
-    ci_high: float = np.nan
-    tau: float = np.nan
-    wald_p: float = np.nan
-    iterations: int = 0
-    converged: bool = False
-
-
 def prepare_kinship(K: np.ndarray, symmetry_tolerance: float = 1e-8) -> tuple[np.ndarray, KinshipDiagnostics]:
     """Validate, normalise and roundoff-correct a sample covariance matrix.
 
@@ -715,57 +700,6 @@ def score_predictor(
         cache,
         compute_spa_adjustment=compute_spa_adjustment,
     )[0]
-
-
-def fit_full_glmm(
-    y: np.ndarray,
-    predictor: np.ndarray,
-    K: np.ndarray,
-    **kwargs,
-) -> FullFitResult:
-    x = np.asarray(predictor, dtype=np.float64).reshape(-1)
-    try:
-        fit, cache = fit_logistic_mixed(y, K, covariates=x, **kwargs)
-    except (ValueError, np.linalg.LinAlgError) as exc:
-        return FullFitResult(status=f"FULL_FIT_ERROR:{exc}")
-    if fit.status != "OK" or not cache:
-        return FullFitResult(
-            status=f"FULL_{fit.status}",
-            tau=fit.tau,
-            iterations=fit.iterations,
-            converged=fit.converged,
-        )
-    beta = float(fit.beta[-1])
-    covariance = np.asarray(cache["M_inv"])
-    variance = float(covariance[-1, -1])
-    if not np.isfinite(variance) or variance <= 0:
-        return FullFitResult(status="FULL_BAD_INFORMATION", tau=fit.tau, iterations=fit.iterations, converged=True)
-    se = math.sqrt(variance)
-    if not np.isfinite(beta) or abs(beta) > 20.0 or not np.isfinite(se) or se > 20.0:
-        return FullFitResult(
-            status="FULL_SEPARATION_OR_UNSTABLE",
-            beta=beta,
-            se=se,
-            tau=fit.tau,
-            iterations=fit.iterations,
-            converged=True,
-        )
-    z = beta / se
-    p = float(2.0 * stats.norm.sf(abs(z)))
-    low = beta - 1.959963984540054 * se
-    high = beta + 1.959963984540054 * se
-    return FullFitResult(
-        status="OK",
-        beta=beta,
-        se=se,
-        odds_ratio=float(math.exp(beta)),
-        ci_low=float(math.exp(low)),
-        ci_high=float(math.exp(high)),
-        tau=fit.tau,
-        wald_p=p,
-        iterations=fit.iterations,
-        converged=True,
-    )
 
 
 def neglog10(p: float) -> float:
