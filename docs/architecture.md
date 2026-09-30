@@ -45,7 +45,8 @@ choices rather than implementation detail.
 
 ## Deliberately separate work
 
-LD/distance classification, gene annotation, and effect-size estimation belong
-in a future `ko-variation-annotation` package. Keeping them outside the scanner
+Physical-distance classification, gene annotation, raw effect summaries, and
+network exports are implemented in the separate `ko-variation-annotation` CLI
+and downstream modules (see `downstream.md`). Keeping them outside the scanner
 prevents screening significance, biological annotation, and post-selection
 effect estimation from being confused.

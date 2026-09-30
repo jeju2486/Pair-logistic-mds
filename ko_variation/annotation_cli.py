@@ -1,0 +1,69 @@
+"""Separate optional helpers; the scanner CLI is unchanged."""
+from __future__ import annotations
+import argparse
+from dataclasses import asdict
+import hashlib
+import json
+from pathlib import Path
+import sys
+import pandas as pd
+from .postprocess import SelectionConfig, select_distal_signals
+from .network import build_gene_network, export_gene_network
+from . import __version__
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Select distal KOVAR signals, calculate raw ORs, and optionally export gene networks")
+    parser.add_argument("--results", required=True, help="Original ko_variation.tsv")
+    parser.add_argument("--out", required=True, help="Output prefix; must differ from input")
+    parser.add_argument("--annotation", help="TSV: locus, gene; optional contig, position, label, product, group")
+    parser.add_argument("--significance-column", choices=["q_bh", "p_primary", "p_score", "p_spa"], default="q_bh")
+    parser.add_argument("--significance-threshold", type=float, default=0.05)
+    parser.add_argument("--ld-distance", type=float, default=10000, help="Exclude distances <= cutoff; physical-distance proxy for linkage")
+    parser.add_argument("--distance-column", default="distance")
+    parser.add_argument("--cross-contig", choices=["exclude", "distal"], default="exclude")
+    parser.add_argument("--zero-cell-correction", type=float, default=0.5)
+    parser.add_argument("--confidence", type=float, default=0.95)
+    parser.add_argument("--network", action="store_true", help="Export PNG, offline HTML, and node/edge TSVs")
+    parser.add_argument("--missing-genes", choices=["error", "drop"], default="error")
+    parser.add_argument("--include-self", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument("--title", default="Distal gene covariation")
+    args = parser.parse_args(argv)
+    config = SelectionConfig(**{key: getattr(args, key) for key in asdict(SelectionConfig())})
+    prefix = Path(args.out)
+    target = Path(str(prefix) + ".distal.tsv")
+    destinations = [target, Path(str(prefix) + ".selection.json")]
+    if args.network:
+        destinations += [Path(str(prefix) + suffix) for suffix in (".png", ".html", ".nodes.tsv", ".edges.tsv")]
+    inputs = [Path(args.results)] + ([Path(args.annotation)] if args.annotation else [])
+    if any(output.resolve() == source.resolve() for output in destinations for source in inputs):
+        parser.error("Output paths must not overwrite input files")
+    try:
+        results = pd.read_csv(args.results, sep="\t")
+        annotation = pd.read_csv(args.annotation, sep="\t", dtype={"gene": str, "contig": str, "label": str, "product": str, "group": str}) if args.annotation else None
+        signals = select_distal_signals(results, config, annotation)
+        if args.network:
+            nodes, edges = build_gene_network(signals, significance_column=args.significance_column,
+                                             include_self=args.include_self, missing_genes=args.missing_genes)
+            export_gene_network(nodes, edges, prefix, seed=args.seed, dpi=args.dpi, title=args.title)
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        signals.to_csv(target, sep="\t", index=False)
+        provenance = dict(version=__version__, config=asdict(config), input_rows=len(results), selected_rows=len(signals),
+                          input_results=str(Path(args.results).resolve()), annotation=args.annotation,
+                          input_sha256={str(source.resolve()): hashlib.sha256(source.read_bytes()).hexdigest() for source in inputs},
+                          effect_method="raw_contingency_table_unadjusted", adjusted_effects="not_estimated",
+                          network=dict(enabled=args.network, seed=args.seed, dpi=args.dpi, include_self=args.include_self,
+                                       missing_genes=args.missing_genes, node_count=len(nodes) if args.network else 0,
+                                       edge_count=len(edges) if args.network else 0))
+        Path(str(prefix) + ".selection.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
+    except (ValueError, OSError, ImportError) as exc:
+        sys.stderr.write(f"Annotation error: {exc}\n")
+        return 2
+    print(f"Selected {len(signals)} of {len(results)} pairs: {target}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -6,9 +6,10 @@ sample covariance, a binary logistic mixed-model null fit, and a score test.
 The output is evidence against no adjusted association; it is not an effect
 size, a causal direction, or proof of biological epistasis.
 
-Version 0.8.3 reports one result for each unordered pair. Physical-linkage
-classification, gene annotation, and effect-size estimation are deliberately
-left for a future separate `ko-variation-annotation` tool.
+Version 0.8.3 reports one result for each unordered pair. The separate
+`ko-variation-annotation` helper selects distal significant signals, calculates
+explicitly unadjusted table odds ratios, and exports annotated gene networks.
+See [downstream usage and interpretation](docs/downstream.md).
 
 ## Installation
 
@@ -107,6 +108,24 @@ last two thresholds. The graph-count fraction is fixed at 0.05 in this release.
 `p_primary` is a significance measure, not the magnitude of covariation.
 `primary_method` says whether it came from the normal score approximation or a
 successful SPA calculation. `neglog10_p` is intended for plotting.
+
+## Downstream helpers
+
+```bash
+pip install -e '.[network]'
+ko-variation-annotation --results kovar_results/ko_variation.tsv \
+  --annotation loci.tsv --out downstream/hits --network \
+  --ld-distance 10000 --significance-threshold 0.05
+```
+
+Annotation requires zero-based `locus` and stable `gene` columns. The default
+selects original `q_bh <= 0.05` and physical `distance > 10000` in matching units.
+Outputs include raw ORs and descriptive CIs, a 300-DPI PNG, offline interactive
+HTML, and supporting node/edge tables. Raw ORs are not phylogeny-adjusted effects;
+gene edges summarize covariation candidates, not proven functional interactions.
+Run `python examples/downstream/reproduce.py` for a synthetic reproducible example.
+Full options, zero-cell handling, coordinate fallback, and aggregation rules are
+documented in [docs/downstream.md](docs/downstream.md).
 
 ## Checkpoint and resume
 

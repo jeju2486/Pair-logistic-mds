@@ -20,9 +20,13 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/jeju2486/Pair-logistic-mds"
 
+[project.optional-dependencies]
+network = ["matplotlib>=3.6", "networkx>=2.8"]
+
 [project.scripts]
 ko-variation = "ko_variation.cli:main"
 ko-variation-plot = "ko_variation.plot_cli:main"
+ko-variation-annotation = "ko_variation.annotation_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
