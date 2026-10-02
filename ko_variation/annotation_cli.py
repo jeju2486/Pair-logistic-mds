@@ -2,27 +2,29 @@
 from __future__ import annotations
 import argparse
 from dataclasses import asdict
-import hashlib
 import json
 from pathlib import Path
 import sys
 import pandas as pd
-from .postprocess import SelectionConfig, select_distal_signals
+from .postprocess import SelectionConfig, select_distal_signals, fit_selected_effects
 from .network import build_gene_network, export_gene_network
 from . import __version__
+from .io_utils import read_fake_fasta
+from .kinship import build_tree_covariance
+from .glmm import prepare_kinship
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Select distal KOVAR signals, calculate raw ORs, and optionally export gene networks")
+    parser = argparse.ArgumentParser(description="Select Bonferroni-significant distal pairs, refit adjusted effects, and optionally export gene networks")
     parser.add_argument("--results", required=True, help="Original ko_variation.tsv")
     parser.add_argument("--out", required=True, help="Output prefix; must differ from input")
+    parser.add_argument("--fasta", required=True, help="Original scanner binary FASTA")
+    parser.add_argument("--tree", required=True, help="Original rooted tree with branch lengths")
     parser.add_argument("--annotation", help="TSV: locus, gene; optional contig, position, label, product, group")
-    parser.add_argument("--significance-column", choices=["q_bh", "p_primary", "p_score", "p_spa"], default="q_bh")
-    parser.add_argument("--significance-threshold", type=float, default=0.05)
-    parser.add_argument("--ld-distance", type=float, default=10000, help="Exclude distances <= cutoff; physical-distance proxy for linkage")
+    parser.add_argument("--significance-threshold", type=float, default=0.05, help="Bonferroni family-wise alpha; cutoff is alpha / original n_tests (default: 0.05)")
+    parser.add_argument("--ld-distance", type=float, default=0, help="Exclude distances <= cutoff (default: 0); physical-distance proxy for linkage")
     parser.add_argument("--distance-column", default="distance")
     parser.add_argument("--cross-contig", choices=["exclude", "distal"], default="exclude")
-    parser.add_argument("--zero-cell-correction", type=float, default=0.5)
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--network", action="store_true", help="Export PNG, offline HTML, and node/edge TSVs")
     parser.add_argument("--missing-genes", choices=["error", "drop"], default="error")
@@ -37,23 +39,31 @@ def main(argv: list[str] | None = None) -> int:
     destinations = [target, Path(str(prefix) + ".selection.json")]
     if args.network:
         destinations += [Path(str(prefix) + suffix) for suffix in (".png", ".html", ".nodes.tsv", ".edges.tsv")]
-    inputs = [Path(args.results)] + ([Path(args.annotation)] if args.annotation else [])
+    inputs = [Path(args.results), Path(args.fasta), Path(args.tree)] + ([Path(args.annotation)] if args.annotation else [])
     if any(output.resolve() == source.resolve() for output in destinations for source in inputs):
         parser.error("Output paths must not overwrite input files")
     try:
         results = pd.read_csv(args.results, sep="\t")
         annotation = pd.read_csv(args.annotation, sep="\t", dtype={"gene": str, "contig": str, "label": str, "product": str, "group": str}) if args.annotation else None
         signals = select_distal_signals(results, config, annotation)
+        fasta = read_fake_fasta(args.fasta)
+        # Empty selections require no tree covariance or alternative fits.
+        if signals.empty:
+            import numpy as np
+            signals = fit_selected_effects(signals, fasta.X, np.zeros((0, 0)), confidence=args.confidence)
+        else:
+            print(f"Refitting {len(signals)} selected pairs", flush=True)
+            K, _ = prepare_kinship(build_tree_covariance(args.tree, fasta.sample_names).K)
+            signals = fit_selected_effects(signals, fasta.X, K, confidence=args.confidence)
         if args.network:
-            nodes, edges = build_gene_network(signals, significance_column=args.significance_column,
+            nodes, edges = build_gene_network(signals, significance_column="p_primary",
                                              include_self=args.include_self, missing_genes=args.missing_genes)
             export_gene_network(nodes, edges, prefix, seed=args.seed, dpi=args.dpi, title=args.title)
         prefix.parent.mkdir(parents=True, exist_ok=True)
         signals.to_csv(target, sep="\t", index=False)
         provenance = dict(version=__version__, config=asdict(config), input_rows=len(results), selected_rows=len(signals),
-                          input_results=str(Path(args.results).resolve()), annotation=args.annotation,
-                          input_sha256={str(source.resolve()): hashlib.sha256(source.read_bytes()).hexdigest() for source in inputs},
-                          effect_method="raw_contingency_table_unadjusted", adjusted_effects="not_estimated",
+                          inputs=[str(source.resolve()) for source in inputs], confidence=args.confidence,
+                          effect_method="alternative_logistic_mixed_pql", effect_status_counts=signals.effect_status.value_counts().to_dict(),
                           network=dict(enabled=args.network, seed=args.seed, dpi=args.dpi, include_self=args.include_self,
                                        missing_genes=args.missing_genes, node_count=len(nodes) if args.network else 0,
                                        edge_count=len(edges) if args.network else 0))

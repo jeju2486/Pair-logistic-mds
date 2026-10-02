@@ -1,115 +1,119 @@
-# Distal signals and gene networks
+# Selected adjusted effects and gene networks
 
-Install the optional exporter dependencies with `pip install -e '.[network]'`.
-The scanner and existing `ko-variation-plot` command retain their interfaces.
+The scanner CLI is unchanged. The add-on reuses its existing readers and PQL
+mixed-model fitter; only selected pairs need an alternative fit. No raw effects
+are calculated and no additional statistical dependencies are required.
 
 ```bash
 ko-variation-annotation --results kovar_results/ko_variation.tsv \
+  --fasta binary.fa --tree rooted_tree.nwk \
   --annotation loci.tsv --out downstream/hits --network \
-  --significance-column q_bh --significance-threshold 0.05 --ld-distance 10000
+  --significance-threshold 0.05 --ld-distance 0
 ```
 
-The same command is available as `python -m ko_variation.annotation_cli`.
-Without `--network`, selection/effect calculation needs only core dependencies.
+The same command runs as `python -m ko_variation.annotation_cli`. Network exports
+require `pip install -e '.[network]'`; omit `--network` for effects alone.
 
-## Selection contract
+## Selection parameters
 
-The helper reads the current scanner's canonical zero-based `u < v` schema,
-four joint counts, `status`, and a chosen significance column. Only `OK` and
-`OK_SPA_FAILED` rows can pass. The latter uses the valid normal fallback after
-SPA failure; choosing `p_spa` excludes its missing SPA values. Missing
-significance values are excluded; malformed or out-of-range values are errors.
-Significance is **<=** the threshold; physical distance is **>** the LD cutoff.
-BH q-values are taken from the original full scan, never recalculated after
-filtering. Choosing raw p-values requires an appropriate multiplicity decision.
+`--significance-threshold` is the Bonferroni family-wise alpha, **0.05 by default**.
+Keep `p_primary <= alpha / n_tests`, using `n_tests` from the full original scan.
+If that column is absent, count nonmissing primary p-values before filtering:
+use a complete result file in that case. Do not divide by the number of selected
+hits or refits. Only scanner statuses `OK` and `OK_SPA_FAILED` are eligible.
+The latter retains the valid normal-score fallback after SPA failure. Original
+screening p-values and q-values remain unchanged; no new p-values are computed.
 
-`--distance-column` defaults to `distance`. The chosen column must contain
-nonnegative finite distances or missing values; missing distances are excluded.
-Input metadata units must match `--ld-distance`; the helper does not infer units
-or interpret locus-index differences as base pairs. For PAN-GWES distance ranges,
-consider explicitly choosing `min_distance` to require distal separation across
-all represented genomes. A physical cutoff is a proxy for linkage, not measured
-LD (r-squared), an LD-decay estimate, or evidence against co-transfer.
+`--ld-distance` is **0 by default**, with the strict rule `distance > cutoff`.
+Both defaults can be overridden. Zero imposes no positive linkage-exclusion
+window and is not evidence that selected loci are biologically unlinked.
+Distances must use units matching the cutoff. Physical distance is a proxy for
+linkage, not a measured LD statistic such as r-squared.
 
-If the chosen distance column is absent, supply annotation `contig` and
-`position` columns. Positions must use one coordinate convention and reference;
-absolute differences give linear physical distances. Circular chromosomes need
-a precomputed shortest-path distance column; linear coordinates alone are not
-sufficient. When contigs are known, cross-contig pairs are excluded by default;
-`--cross-contig distal` retains them with missing physical distance and an
-explicit `cross_contig` class. Missing contig annotations do not establish
-cross-contig separation. An existing distance column takes priority over
-annotation coordinates. A distance-only input cannot identify cross-contig pairs.
+`--distance-column` defaults to `distance`; missing distances are excluded.
+For PAN-GWES ranges, choose `min_distance` to require separation across all
+represented genomes. If the chosen column is absent, optional annotation
+`contig` and `position` columns give absolute linear distances. Circular genomes
+require a precomputed shortest-path distance column. Known cross-contig pairs
+are excluded unless `--cross-contig distal` is supplied. They then have missing
+physical distance and an explicit class. A distance-only file cannot identify
+cross-contig pairs; supplied distances take priority over coordinates.
 
-## Raw effects and adjusted inference
+## Selected alternative fits
 
-For presence/absence coding, `raw_odds_ratio = n11*n00/(n10*n01)`; OR > 1 means
-co-presence/co-absence enrichment and OR < 1 means opposing states. Swapping
-the two loci preserves OR; complementing one locus inverts it. These are
-**unadjusted descriptive effects**, even when selected by phylogeny-adjusted
-score p-values. They do not establish epistasis or a causal direction.
+Supply the **same original FASTA and tree** used for screening. Tree tips must
+match sample names; the covariance is built in FASTA order and prepared once.
+Selected joint counts are checked against the supplied genotypes before refits.
+This check cannot prove the supplied tree or sample-locus assignments are the
+original ones; a TSV alone does not contain those provenance fingerprints.
 
-If any cell is zero, the default adds 0.5 to all four cells of that table;
-otherwise no correction is applied. `raw_or_correction` records the addition.
-Use `--zero-cell-correction 0` for uncorrected boundary values: OR can be zero,
-infinite, or undefined. A two-sided Wald interval uses log(OR) +/- z*sqrt(sum(1/n)),
-with `--confidence 0.95` by default. Uncorrected zero cells yield missing SE/CI.
-These intervals assume independent observations; they do not account for
-phylogeny, selection, or multiple testing and can be unreliable for sparse cells.
+For each selected canonical pair `u < v`, the alternative is:
 
-No phylogeny-adjusted effect is estimated by these helpers. Such an estimate
-requires original sample genotypes, the aligned tree/covariance, and an
-alternative logistic mixed model with the other locus as a predictor, including
-convergence, separation, variance-component and uncertainty diagnostics. The
-scanner's null-model p-value or z-statistic cannot supply that coefficient.
+```text
+logit P(v_i = 1) = alpha + beta * u_i + b_i
+b ~ N(0, tau * K)
+```
 
-## Annotation and gene aggregation
+The existing PQL/pseudo-REML fitter estimates beta and tau. Reported columns are
+`adjusted_beta`, `adjusted_beta_se`, `adjusted_odds_ratio = exp(beta)`,
+`adjusted_or_ci_low`, `adjusted_or_ci_high`, `alternative_tau`, `effect_status`,
+`effect_iterations`, `effect_message`, `effect_method`, and `effect_confidence`.
+`--confidence` defaults to 0.95. SE comes from the final working-model covariance
+`(C^T V^-1 C)^-1`; C contains the intercept and predictor and
+V = diag(1/working_weights) + tau*K. CIs are exp(beta +/- z*SE).
 
-`loci.tsv` is tab-separated with one row per zero-based `locus` and a nonempty
-`gene`. Optional `label`, `product`, and `group` annotate nodes; optional
-`contig`/`position` enable the distance fallback. Use stable gene IDs; repeating
-a gene name for distinct genomic copies collapses them into one node. Duplicate
-locus mappings are errors. One-to-many mappings must be resolved before use.
+These are **approximate PQL Wald intervals**, treating fitted tau as fixed.
+They do not include variance-component uncertainty, selection correction, or
+multiple-comparison coverage. Significant-pair selection can inflate effects.
+PQL remains experimental, particularly with sparse binary data. The orientation
+u -> v is computational, not causal; reversing a mixed-model fit need not give
+an identical estimate. Report the original locus orientation alongside effects.
 
-Missing gene mappings cause an error during network construction unless
-`--missing-genes drop` is specified. Same-gene pairs are omitted unless
-`--include-self` is set. Node size represents the number of distinct other gene
-neighbours; color represents annotation group. Tables report distinct contributing
-loci and supporting pair counts. Conflicting annotation attributes are joined
-in sorted order, retaining all supplied text.
+Zero joint cells indicate separation or monomorphic states and are skipped.
+Failed convergence, variance-search boundaries, clipped working weights, and
+nonfinite effects produce explicit statuses with missing effect/CI fields.
+No raw OR or continuity correction is computed. Failed pairs stay in the TSV.
+An empty selection skips covariance construction and alternative fitting.
 
-Each unordered gene edge aggregates unique locus pairs and records their IDs,
-count, minimum selected significance, and the raw OR of the most significant
-supporting pair (ties resolved by u/v). **The minimum is descriptive, not a
-gene-level p-value or corrected gene test.** ORs are never pooled: pairs can use
-the same isolates and be statistically dependent. Edge color records positive,
-negative, mixed, neutral, or unknown raw directions; width represents pair count.
-Representative ORs remain locus effects, not inferred gene interaction strengths.
+## Gene networks
 
-Outputs are `PREFIX.distal.tsv`, `PREFIX.selection.json`, and, with `--network`,
-`PREFIX.nodes.tsv`, `PREFIX.edges.tsv`, `PREFIX.png`, and `PREFIX.html`.
-The JSON records version, selection settings, input paths and SHA-256 hashes,
-counts and exporter settings.
-PNG is 300 DPI by default (`--dpi`); PNG and HTML use the same deterministic
-layout (`--seed 42`). The HTML works offline with search, pan, zoom, hover and
-click details. Gene/annotation text is escaped, with no external scripts.
-Large dense networks may require stricter selection or separate component plots
-for readable publication panels. An empty selection still produces valid outputs.
+Annotation is TSV with one row per zero-based `locus` and stable nonempty `gene`.
+Optional `label`, `product`, and `group` annotate nodes. Resolve one-to-many locus
+mappings beforehand; duplicate locus mappings are rejected. Gene IDs shared
+across distinct copies collapse those copies into one node.
 
-## Python entry points and reproducible example
+Missing mappings are errors unless `--missing-genes drop` is set. Same-gene
+pairs are excluded unless `--include-self` is set. Node size represents degree,
+node color represents annotation group, and edge width represents locus-pair
+support count. All unique supporting locus pairs are retained on each gene edge.
+
+The representative effect is the most significant **successful adjusted fit**,
+with u/v tie-breaking; if no refit succeeds, the edge has a missing effect.
+`n_adjusted_pairs` records successful refits. Edge color shows positive, negative,
+mixed, neutral, or unknown adjusted directions. Failed fits cannot contribute
+to effect direction. ORs are not pooled because supporting pairs may be dependent.
+The edge's minimum primary p-value includes all supporting selected pairs and
+is descriptive, **not a gene-level p-value**. A gene edge remains a covariation
+candidate, not demonstrated functional epistasis.
+
+## Outputs and example
+
+The command writes `PREFIX.distal.tsv` and `PREFIX.selection.json`, which records
+settings, input paths, selected counts, and effect-status counts. With `--network`
+it also writes `.nodes.tsv`, `.edges.tsv`, `.png`, and offline `.html`.
+PNG defaults to 300 DPI; PNG and HTML share the seeded layout (`--seed 42`).
+HTML supports search, pan, zoom, and node/edge details without external scripts.
+Dense networks may require stricter selection for legible publication panels.
 
 ```python
-from ko_variation.postprocess import SelectionConfig, select_distal_signals
-from ko_variation.network import build_gene_network, export_gene_network
+from ko_variation.postprocess import SelectionConfig, select_distal_signals, fit_selected_effects
 
-signals = select_distal_signals(results, SelectionConfig(ld_distance=10000), annotation)
-nodes, edges = build_gene_network(signals)
-export_gene_network(nodes, edges, "downstream/hits")
+signals = select_distal_signals(results, SelectionConfig(significance_threshold=0.05, ld_distance=0), annotation)
+effects = fit_selected_effects(signals, X, prepared_K)
 ```
 
-Here `results` and `annotation` are pandas DataFrames loaded from the TSVs.
-Run `python examples/downstream/reproduce.py` from the installed repository.
-It generates synthetic current-schema scanner output and all downstream files
-under `examples/downstream/output/`. It uses zero relatedness as a statistical
-oracle and makes no biological claims. Run the tests with
-`python -m unittest discover -s tests -v`.
+`X` is the original sample-by-locus binary matrix and `prepared_K` is the aligned
+covariance prepared by `ko_variation.glmm.prepare_kinship`.
+Run `python examples/downstream/reproduce.py` for a synthetic star-tree example
+with scanner output, alternative fits, and network exports. Minimal focused
+checks: `python -m unittest discover -s tests -p test_postprocess.py`.

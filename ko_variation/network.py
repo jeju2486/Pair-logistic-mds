@@ -11,22 +11,22 @@ from .postprocess import _require, annotate_pairs
 
 
 EDGE_COLUMNS = ["gene_a", "gene_b", "n_locus_pairs", "min_significance", "significance_column", "representative_u",
-                "representative_v", "representative_raw_odds_ratio", "raw_direction", "locus_pairs"]
+                "representative_v", "representative_adjusted_odds_ratio", "adjusted_direction", "n_adjusted_pairs", "locus_pairs"]
 NODE_COLUMNS = ["gene", "label", "product", "group", "n_loci", "degree", "n_supporting_pairs"]
 
 
 def build_gene_network(signals: pd.DataFrame, annotation: pd.DataFrame | None = None,
-                       *, significance_column: str = "q_bh", include_self: bool = False,
+                       *, significance_column: str = "p_primary", include_self: bool = False,
                        missing_genes: str = "error") -> tuple[pd.DataFrame, pd.DataFrame]:
     """Aggregate unique locus pairs per unordered gene pair, without pooling ORs.
 
-    The representative is the smallest-significance pair (ties: u, v). Its OR
+    The representative is the smallest-significance successful refit (ties: u, v). Its OR
     remains a locus effect. min_significance is descriptive, not a gene-level test.
     """
     if missing_genes not in {"error", "drop"}:
         raise ValueError("missing_genes must be error or drop")
     data = annotate_pairs(signals, annotation) if annotation is not None else signals.copy()
-    _require(data, ["u", "v", "u_gene", "v_gene", significance_column, "raw_odds_ratio", "raw_log_odds_ratio"])
+    _require(data, ["u", "v", "u_gene", "v_gene", significance_column, "adjusted_odds_ratio", "adjusted_beta", "effect_status"])
     if data.duplicated(["u", "v"]).any():
         raise ValueError("Duplicate locus pairs cannot be counted as independent support")
     missing = data.u_gene.isna() | data.v_gene.isna() | data.u_gene.astype(str).str.strip().eq("") | data.v_gene.astype(str).str.strip().eq("")
@@ -46,14 +46,15 @@ def build_gene_network(signals: pd.DataFrame, annotation: pd.DataFrame | None = 
     edges = []
     for (a, b), block in data.groupby(["gene_a", "gene_b"], sort=True):
         block = block.sort_values([significance_column, "u", "v"], kind="stable")
-        representative = block.iloc[0]
-        effects = pd.to_numeric(block.raw_log_odds_ratio, errors="raise").to_numpy(float)
+        fitted = block.loc[block.effect_status.eq("OK")]
+        representative = fitted.iloc[0] if len(fitted) else block.iloc[0]
+        effects = pd.to_numeric(fitted.adjusted_beta, errors="raise").to_numpy(float)
         direction = ("mixed" if (effects > 0).any() and (effects < 0).any() else
                      "positive" if (effects > 0).any() else "negative" if (effects < 0).any() else
                      "neutral" if (effects == 0).any() else "unknown")
-        edges.append([a, b, len(block), float(representative[significance_column]), significance_column,
-                      int(representative.u), int(representative.v), float(representative.raw_odds_ratio),
-                      direction, json.dumps([[int(row.u), int(row.v)] for row in block.itertuples()])])
+        edges.append([a, b, len(block), float(block.iloc[0][significance_column]), significance_column,
+                      int(representative.u), int(representative.v), float(representative.adjusted_odds_ratio),
+                      direction, len(fitted), json.dumps([[int(row.u), int(row.v)] for row in block.itertuples()])])
     edge_frame = pd.DataFrame(edges, columns=EDGE_COLUMNS)
     nodes = []
     for gene in sorted(set(edge_frame.gene_a) | set(edge_frame.gene_b)):
@@ -109,7 +110,7 @@ def export_gene_network(nodes: pd.DataFrame, edges: pd.DataFrame, prefix: str | 
                                node_color=[group_colors[g] for g in nodes.group], edgecolors="white")
         nx.draw_networkx_edges(graph, positions, ax=ax,
                                edgelist=list(zip(edges.gene_a, edges.gene_b)),
-                               edge_color=[colors[d] for d in edges.raw_direction],
+                               edge_color=[colors[d] for d in edges.adjusted_direction],
                                width=[1 + np.log2(n) for n in edges.n_locus_pairs], alpha=0.75)
         nx.draw_networkx_labels(graph, positions, labels=dict(zip(nodes.gene, nodes.label)), ax=ax, font_size=8)
         ax.margins(0.2)
@@ -117,11 +118,11 @@ def export_gene_network(nodes: pd.DataFrame, edges: pd.DataFrame, prefix: str | 
         ax.text(0.5, 0.5, "No gene pairs pass selection", ha="center", transform=ax.transAxes)
     ax.set_title(title)
     ax.axis("off")
-    handles = [Line2D([0], [0], color=c, label=d) for d, c in colors.items() if d in set(edges.raw_direction)]
+    handles = [Line2D([0], [0], color=c, label=d) for d, c in colors.items() if d in set(edges.adjusted_direction)]
     handles += [Line2D([0], [0], marker="o", linestyle="", color=c, label="Group: " + (g or "unassigned")) for g, c in group_colors.items()]
     if handles:
         ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1, 1), frameon=False, fontsize=8)
-    fig.text(0.02, 0.02, "Node size: degree | Edge width: locus-pair count | Edge color: raw OR direction\nCovariation candidates; edge minima are not gene-level p-values.", fontsize=8)
+    fig.text(0.02, 0.02, "Node size: degree | Edge width: locus-pair count | Edge color: adjusted OR direction\nCovariation candidates; edge minima are not gene-level p-values.", fontsize=8)
     fig.savefig(paths["png"], dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     payload_nodes = []
@@ -130,15 +131,15 @@ def export_gene_network(nodes: pd.DataFrame, edges: pd.DataFrame, prefix: str | 
         payload_nodes.append(dict(row, x=float(500 + 300 * x), y=float(400 - 300 * y), color=group_colors[row["group"]]))
     payload_edges = []
     for row in edges.to_dict("records"):
-        # JSON has no Infinity/NaN: display boundary ORs as strings.
-        value = row["representative_raw_odds_ratio"]
+        # JSON has no NaN: missing adjusted effects are null.
+        value = row["representative_adjusted_odds_ratio"]
         if not np.isfinite(value):
-            row["representative_raw_odds_ratio"] = str(value)
-        payload_edges.append(dict(row, color=colors[row["raw_direction"]]))
+            row["representative_adjusted_odds_ratio"] = None
+        payload_edges.append(dict(row, color=colors[row["adjusted_direction"]]))
     payload = json.dumps({"nodes": payload_nodes, "edges": payload_edges}, allow_nan=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     document = '''<!doctype html><html lang="en"><meta charset="utf-8"><title>__TITLE__</title>
 <style>body{font:15px system-ui;margin:20px;background:#fafafa}svg{width:100%;height:75vh;background:white;border:1px solid #ddd;touch-action:none}#details{white-space:pre-wrap}button,input{padding:8px;margin:5px}text{font:12px system-ui}circle,line,path{cursor:pointer}</style>
-<h1>__TITLE__</h1><p>Node size: degree; node color: annotation group. Edge width: supporting locus pairs. Edge color: raw OR direction (red positive, blue negative, purple mixed, grey neutral/unknown). Undirected covariation candidates; minimum significance is not a gene-level test.</p>
+<h1>__TITLE__</h1><p>Node size: degree; node color: annotation group. Edge width: supporting locus pairs. Edge color: adjusted OR direction (red positive, blue negative, purple mixed, grey neutral/unknown). Undirected covariation candidates; minimum significance is not a gene-level test.</p>
 <label>Find gene or label <input id="search"></label><button id="reset">Reset view</button>
 <svg id="canvas" viewBox="0 0 1000 800" role="img" aria-label="Interactive gene covariation network"><g id="scene"></g></svg>
 <p>Scroll to zoom; drag to pan; select a node or edge for details. Hover for a summary. All supporting pairs are in the accompanying edge table.</p><pre id="details">Select a node or edge.</pre>

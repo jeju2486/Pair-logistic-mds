@@ -25,8 +25,9 @@ construction, KOVAR version, and null-model convergence. Call results
 "phylogeny-adjusted covariation candidates" unless independent evidence supports
 a mechanistic epistasis claim.
 
-The separate `ko-variation-annotation` workflow calculates raw descriptive table
-odds ratios after explicit significance and physical-distance filters, and
-exports annotated gene networks. These ORs are unadjusted; adjusted estimates
-require original genotypes/tree and an alternative model. Gene-edge significance
+The separate `ko-variation-annotation` workflow fits alternative logistic mixed
+models only after Bonferroni significance and physical-distance filters, using
+original genotypes/tree. It reports adjusted ORs and approximate PQL Wald CIs,
+plus fit status; it does not calculate raw ORs. It also exports annotated gene
+networks. Effects may be inflated by post-selection bias. Gene-edge significance
 minima are summaries, not gene-level tests. See [downstream.md](downstream.md).

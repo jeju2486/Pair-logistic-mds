@@ -8,7 +8,7 @@ size, a causal direction, or proof of biological epistasis.
 
 Version 0.8.3 reports one result for each unordered pair. The separate
 `ko-variation-annotation` helper selects distal significant signals, calculates
-explicitly unadjusted table odds ratios, and exports annotated gene networks.
+phylogeny-adjusted alternative-model odds ratios, and exports annotated gene networks.
 See [downstream usage and interpretation](docs/downstream.md).
 
 ## Installation
@@ -114,17 +114,19 @@ successful SPA calculation. `neglog10_p` is intended for plotting.
 ```bash
 pip install -e '.[network]'
 ko-variation-annotation --results kovar_results/ko_variation.tsv \
+  --fasta binary.fa --tree rooted_tree.nwk \
   --annotation loci.tsv --out downstream/hits --network \
-  --ld-distance 10000 --significance-threshold 0.05
+  --ld-distance 0 --significance-threshold 0.05
 ```
 
 Annotation requires zero-based `locus` and stable `gene` columns. The default
-selects original `q_bh <= 0.05` and physical `distance > 10000` in matching units.
-Outputs include raw ORs and descriptive CIs, a 300-DPI PNG, offline interactive
-HTML, and supporting node/edge tables. Raw ORs are not phylogeny-adjusted effects;
+selects `p_primary <= 0.05 / n_tests` and physical `distance > 0` in matching units.
+Both thresholds are configurable. Only selected pairs are refitted, using the
+original FASTA and tree. Outputs include adjusted ORs and approximate PQL Wald
+CIs, fit diagnostics, a 300-DPI PNG, offline interactive HTML, and node/edge tables;
 gene edges summarize covariation candidates, not proven functional interactions.
 Run `python examples/downstream/reproduce.py` for a synthetic reproducible example.
-Full options, zero-cell handling, coordinate fallback, and aggregation rules are
+Full options, failed-fit handling, coordinate fallback, and aggregation rules are
 documented in [docs/downstream.md](docs/downstream.md).
 
 ## Checkpoint and resume

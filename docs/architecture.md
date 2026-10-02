@@ -45,7 +45,7 @@ choices rather than implementation detail.
 
 ## Deliberately separate work
 
-Physical-distance classification, gene annotation, raw effect summaries, and
+Physical-distance classification, gene annotation, selected alternative fits, and
 network exports are implemented in the separate `ko-variation-annotation` CLI
 and downstream modules (see `downstream.md`). Keeping them outside the scanner
 prevents screening significance, biological annotation, and post-selection
