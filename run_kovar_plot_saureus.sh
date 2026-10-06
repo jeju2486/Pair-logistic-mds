@@ -52,6 +52,13 @@ MISSING_GENES="${MISSING_GENES:-drop}"
 NETWORK_SEED="${NETWORK_SEED:-42}"
 PNG_DPI="${PNG_DPI:-300}"
 KEEP_DISTANCE_PLOT="${KEEP_DISTANCE_PLOT:-0}"
+REDRAW_ONLY="${REDRAW_ONLY:-0}"
+EFFECTS="${EFFECTS:-$PREFIX.distal.tsv}"
+NODE_RADIUS="${NODE_RADIUS:-3 5}"
+LINK_DISTANCES="${LINK_DISTANCES:-20 35 55}"
+STRENGTH_CUTOFFS="${STRENGTH_CUTOFFS:-}"
+COMPONENT_GAP="${COMPONENT_GAP:-16}"
+NETWORK_LABELS="${NETWORK_LABELS:-none}"
 PAIR_CHUNK_ROWS="${PAIR_CHUNK_ROWS:-50000}"
 SCREENED_SCORE="$PREFIX.screened.tsv"
 SCREENING_MANIFEST="$PREFIX.screening.json"
@@ -62,17 +69,24 @@ PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 PROGRESS_SECONDS="${PROGRESS_SECONDS:-60}"
 ANNOTATION_CACHE="$ANNOTATION.cache.json"
 export RESUME
-if [[ "$RESUME" != "0" && "$RESUME" != "1" ]]; then
-    echo "RESUME must be 0 or 1" >&2
+if [[ "$RESUME" != "0" && "$RESUME" != "1" || "$REDRAW_ONLY" != "0" && "$REDRAW_ONLY" != "1" ]]; then
+    echo "RESUME and REDRAW_ONLY must be 0 or 1" >&2
     exit 1
 fi
 
+if [[ "$REDRAW_ONLY" == "0" ]]; then
 for input in "$SCORE" "$FASTA" "$TREE"; do
     if [[ ! -s "$input" ]]; then
         echo "Missing or empty input: $input" >&2
         exit 1
     fi
 done
+else
+    if [[ ! -s "$EFFECTS" ]]; then
+        echo "Missing completed effect table for redraw: $EFFECTS" >&2
+        exit 1
+    fi
+fi
 if [[ ! -s "$KOVAR_REPO/ko_variation/annotation_cli.py" ]]; then
     echo "Missing development helper in: $KOVAR_REPO" >&2
     echo 'Clone feature/downstream-helpers and install its [network] extra; see the accompanying instructions.' >&2
@@ -80,6 +94,10 @@ if [[ ! -s "$KOVAR_REPO/ko_variation/annotation_cli.py" ]]; then
 fi
 if [[ ! -s "$KOVAR_REPO/ko_variation/effect_checkpoint.py" || ! -s "$KOVAR_REPO/ko_variation/workflow_cache.py" ]]; then
     echo "This plotting script needs the updated downstream resume/progress helper in: $KOVAR_REPO" >&2
+    exit 1
+fi
+if [[ ! -s "$KOVAR_REPO/ko_variation/network_cli.py" || ! -s "$KOVAR_REPO/ko_variation/vendor/d3.v7.9.0.min.js" ]]; then
+    echo "Update the development checkout to obtain the compact D3 network exporter." >&2
     exit 1
 fi
 
@@ -94,6 +112,21 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 mkdir -p "$(dirname "$PREFIX")"
+read -r -a NODE_RADIUS_VALUES <<< "$NODE_RADIUS"
+read -r -a LINK_DISTANCE_VALUES <<< "$LINK_DISTANCES"
+NETWORK_ARGS=(--node-radius "${NODE_RADIUS_VALUES[@]}" --link-distances "${LINK_DISTANCE_VALUES[@]}"
+              --component-gap "$COMPONENT_GAP" --labels "$NETWORK_LABELS")
+if [[ -n "$STRENGTH_CUTOFFS" ]]; then
+    read -r -a STRENGTH_VALUES <<< "$STRENGTH_CUTOFFS"
+    NETWORK_ARGS+=(--strength-cutoffs "${STRENGTH_VALUES[@]}")
+fi
+if [[ "$REDRAW_ONLY" == "1" ]]; then
+    "$KOVAR_PYTHON" -m ko_variation.network_cli \
+        --effects "$EFFECTS" --out "$PREFIX" --missing-genes "$MISSING_GENES" \
+        --seed "$NETWORK_SEED" --dpi "$PNG_DPI" --title "" "${NETWORK_ARGS[@]}"
+    echo "Redrawn map: $PREFIX.html; $PREFIX.png; $PREFIX.svg"
+    exit 0
+fi
 
 # Read the full scan in bounded chunks. Count tests BEFORE distance/status filters,
 # then apply the native selector with that original denominator in every chunk.
@@ -494,14 +527,15 @@ ARGS=(
     --seed "$NETWORK_SEED" --dpi "$PNG_DPI" --title ""
     --checkpoint-file "$REFIT_CHECKPOINT"
     --progress-every "$PROGRESS_EVERY" --progress-seconds "$PROGRESS_SECONDS"
+    "${NETWORK_ARGS[@]}"
 )
 if [[ "$RESUME" == "1" && -f "$REFIT_CHECKPOINT" ]]; then
     ARGS+=(--resume)
     echo "[pipeline] resuming completed pair fits from $REFIT_CHECKPOINT"
 fi
 
-# Run the native annotation helper. Save its identical static figure as editable
-# SVG as well as PNG. Original n_tests in the selected input preserves selection.
+# Native export writes PNG, editable SVG and offline D3 HTML from shared coordinates.
+# Original n_tests in the selected input preserves selection.
 SCREENING_MANIFEST="$SCREENING_MANIFEST" "$KOVAR_PYTHON" - "${ARGS[@]}" <<'PY'
 import json
 import os
@@ -512,7 +546,6 @@ import matplotlib
 import pandas as pd
 matplotlib.use("Agg")
 matplotlib.rcParams["svg.fonttype"] = "none"
-from matplotlib.figure import Figure
 from ko_variation import annotation_cli
 
 original_select = annotation_cli.select_distal_signals
@@ -530,17 +563,7 @@ def select_pangwes_distal(results, config=None, annotation=None):
             print(f"Undefined {column} (-1): {int(undefined.sum())} rows treated as missing", flush=True)
     return original_select(results, config, annotation)
 
-original_savefig = Figure.savefig
-def save_png_and_svg(figure, filename, *args, **kwargs):
-    result = original_savefig(figure, filename, *args, **kwargs)
-    if isinstance(filename, (str, os.PathLike)) and Path(filename).suffix.lower() == ".png":
-        svg_kwargs = dict(kwargs)
-        svg_kwargs["format"] = "svg"
-        original_savefig(figure, Path(filename).with_suffix(".svg"), *args, **svg_kwargs)
-    return result
-
-with patch.object(Figure, "savefig", save_png_and_svg), \
-        patch.object(annotation_cli, "select_distal_signals", select_pangwes_distal):
+with patch.object(annotation_cli, "select_distal_signals", select_pangwes_distal):
     exit_code = annotation_cli.main(sys.argv[1:])
 if exit_code == 0:
     screening = json.loads(Path(os.environ["SCREENING_MANIFEST"]).read_text())
@@ -569,3 +592,4 @@ echo "Network tables: $PREFIX.nodes.tsv and $PREFIX.edges.tsv"
 echo "Selection settings and counts: $PREFIX.selection.json"
 echo "Chunked screening: $SCREENING_MANIFEST"
 echo "Retained refit checkpoint: $REFIT_CHECKPOINT"
+echo "Saved layout coordinates and magnitude boundaries: $PREFIX.layout.json"

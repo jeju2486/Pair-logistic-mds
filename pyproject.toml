@@ -33,4 +33,4 @@ where = ["."]
 include = ["ko_variation*"]
 
 [tool.setuptools.package-data]
-ko_variation = ["scripts/*.R"]
+ko_variation = ["scripts/*.R", "templates/*.html", "vendor/*.js", "vendor/*LICENSE*"]

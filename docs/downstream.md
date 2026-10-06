@@ -144,9 +144,10 @@ mappings beforehand; duplicate locus mappings are rejected. Gene IDs shared
 across distinct copies collapse those copies into one node.
 
 Missing mappings are errors unless `--missing-genes drop` is set. Same-gene
-pairs are excluded unless `--include-self` is set. Node size represents degree,
-node color represents annotation group, and edge width represents locus-pair
-support count. All unique supporting locus pairs are retained on each gene edge.
+pairs are excluded unless `--include-self` is set. All unique supporting locus
+pairs remain recorded on each gene edge. Node radius represents degree within a
+small capped range (3–5 diagram units by default); ordinary nodes are charcoal.
+Annotation groups do not control node colours or produce group legends.
 
 The representative effect is the most significant **successful adjusted fit**,
 with u/v tie-breaking; if no refit succeeds, the edge has a missing effect.
@@ -161,10 +162,66 @@ candidate, not demonstrated functional epistasis.
 
 The command writes `PREFIX.distal.tsv` and `PREFIX.selection.json`, which records
 settings, input paths, selected counts, and effect-status counts. With `--network`
-it also writes `.nodes.tsv`, `.edges.tsv`, `.png`, and offline `.html`.
-PNG defaults to 300 DPI; PNG and HTML share the seeded layout (`--seed 42`).
-HTML supports search, pan, zoom, and node/edge details without external scripts.
-Dense networks may require stricter selection for legible publication panels.
+it also writes `.nodes.tsv`, `.edges.tsv`, `.png`, `.svg`, `.layout.json`, and offline `.html`.
+PNG defaults to 300 DPI. PNG, editable SVG and offline D3 HTML start from the
+same saved coordinates (`--seed 42`), recorded in `.layout.json` and the node TSV.
+The bundled D3 v7.9.0 runs without an internet connection. No browser force
+simulation starts automatically; **Compact / reflow** enables it, **Freeze** stops
+it and **Reset layout** restores the original coordinates. Search, hover, dragging,
+zoom and direct-neighbour highlighting support exploration. SVG/PNG exports use
+the current coordinates, including manually moved nodes. Layout JSON saves them.
+
+### Compact display semantics
+
+Connected components are packed close together without community detection. Edge
+width uses the absolute beta of the same representative successful locus refit
+described above, not the supporting-pair count. Width is capped at the within-map
+95th percentile of that magnitude. Positive edges are red (`#C62828`), negative
+blue (`#2166AC`), mixed purple (`#7B3294`) and neutral/unknown grey. Mixed and unknown
+edges are dashed. These colours describe successful fitted association directions.
+A representative beta is a locus-pair coefficient, not a pooled gene-level effect.
+
+Weak/medium/strong are descriptive magnitude categories. Default boundaries are
+the within-map tertiles of finite representative |beta|: weak <= lower boundary;
+medium > lower and <= upper; strong > upper. Ties stay together, so category
+counts need not be equal; identical coefficients all enter weak. Exact boundaries
+are saved in the layout JSON and displayed in the legend. Use common fixed
+`--strength-cutoffs LOW HIGH` for comparable magnitude categories across species.
+These categories do not select edges and do not replace the original P-value rule.
+Edges without successful coefficients remain present as unestimated, with thin
+lines and the medium target length.
+
+Strong, medium and weak target lengths default to 20, 35 and 55 **diagram units**,
+respectively; they are layout preferences, not exact lengths or genomic distances.
+Graph constraints can prevent any edge from attaining its target length. Static
+labels default to none; `--labels hubs` or `all` enables named-gene labels. Generic
+`group_###` labels remain in tables and tooltips rather than cluttering the canvas.
+Display options: `--node-radius MIN MAX`, `--link-distances STRONG MEDIUM WEAK`,
+`--component-gap GAP`, `--strength-cutoffs LOW HIGH`, and `--labels none|hubs|all`.
+
+### Redraw completed results without annotation or refitting
+
+```bash
+python -m ko_variation.network_cli --effects PREFIX.distal.tsv --out PREFIX
+```
+
+This command rebuilds the gene summary and display from the completed annotated
+effect table. It does not reapply significance/distance filters or rerun numerical
+fitting. It writes the network exports and `.network.json` with display settings
+and the source effect-table path. Preserve `.selection.json` for the original
+selection provenance. To change biological selection, rerun the analysis workflow.
+
+The S. aureus wrapper exposes the same options as environment variables:
+
+```bash
+REDRAW_ONLY=1 sbatch run_kovar_plot_saureus.sh
+NODE_RADIUS="3 4" LINK_DISTANCES="15 25 40" REDRAW_ONLY=1 sbatch run_kovar_plot_saureus.sh
+```
+
+`EFFECTS` defaults to `$PREFIX.distal.tsv`. `NETWORK_LABELS` defaults to `none`,
+`COMPONENT_GAP` to 16, and `STRENGTH_CUTOFFS` is optional. Default normal execution
+retains the existing resume/progress behaviour. Display changes do not invalidate
+refit checkpoints.
 
 ```python
 from ko_variation.postprocess import SelectionConfig, select_distal_signals, fit_selected_effects

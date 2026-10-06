@@ -123,7 +123,7 @@ Annotation requires zero-based `locus` and stable `gene` columns. The default
 selects `p_primary <= 0.05 / n_tests` and physical `distance > 0` in matching units.
 Both thresholds are configurable. Only selected pairs are refitted, using the
 original FASTA and tree. Outputs include adjusted ORs and approximate PQL Wald
-CIs, fit diagnostics, a 300-DPI PNG, offline interactive HTML, and node/edge tables;
+CIs, fit diagnostics, a 300-DPI PNG, editable SVG, offline D3 HTML, saved layout coordinates, and node/edge tables;
 gene edges summarize covariation candidates, not proven functional interactions.
 Run `python examples/downstream/reproduce.py` for a synthetic reproducible example.
 Full options, failed-fit handling, coordinate fallback, and aggregation rules are
@@ -195,3 +195,16 @@ kinship eigensystem preparation.
 ### 0.8.0
 
 Introduced the experimental logistic mixed-model score scanner.
+
+
+Completed downstream results can be redrawn without annotation or refitting:
+
+```bash
+python -m ko_variation.network_cli --effects downstream/hits.distal.tsv --out downstream/hits
+```
+
+The compact map uses capped node radii, packed connected components, representative
+locus-pair |beta| for edge width/spacing and association direction for colour. D3
+is bundled for offline search, zoom, dragging, optional reflow and SVG/PNG export.
+See [downstream display options](docs/downstream.md#compact-display-semantics) for
+coefficient boundaries and fixed cross-species display settings.

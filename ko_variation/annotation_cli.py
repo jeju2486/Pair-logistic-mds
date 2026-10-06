@@ -9,6 +9,7 @@ import sqlite3
 import pandas as pd
 from .postprocess import SelectionConfig, select_distal_signals, fit_selected_effects
 from .network import build_gene_network, export_gene_network
+from .network_display import add_network_arguments, network_options
 from . import __version__
 from .io_utils import read_fake_fasta
 from .kinship import build_tree_covariance
@@ -33,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--title", default="Distal gene covariation")
+    add_network_arguments(parser)
     parser.add_argument("--checkpoint-file", help="Per-pair refit checkpoint [OUT.refit.sqlite]; retained after completion")
     parser.add_argument("--resume", action="store_true", help="Reuse completed refits from an exactly matching checkpoint")
     parser.add_argument("--no-checkpoint", action="store_true", help="Disable refit checkpoints")
@@ -50,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     target = Path(str(prefix) + ".distal.tsv")
     destinations = [target, Path(str(prefix) + ".selection.json")]
     if args.network:
-        destinations += [Path(str(prefix) + suffix) for suffix in (".png", ".html", ".nodes.tsv", ".edges.tsv")]
+        destinations += [Path(str(prefix) + suffix) for suffix in (".png", ".svg", ".html", ".nodes.tsv", ".edges.tsv", ".layout.json")]
     inputs = [Path(args.results), Path(args.fasta), Path(args.tree)] + ([Path(args.annotation)] if args.annotation else [])
     checkpoint_file = None if args.no_checkpoint else Path(args.checkpoint_file or str(prefix) + ".refit.sqlite")
     if checkpoint_file is not None:
@@ -84,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
             announce("aggregating gene edges and exporting figures")
             nodes, edges = build_gene_network(signals, significance_column="p_primary",
                                              include_self=args.include_self, missing_genes=args.missing_genes)
-            export_gene_network(nodes, edges, prefix, seed=args.seed, dpi=args.dpi, title=args.title)
+            export_gene_network(nodes, edges, prefix, seed=args.seed, dpi=args.dpi, title=args.title, **network_options(args))
         prefix.parent.mkdir(parents=True, exist_ok=True)
         signals.to_csv(target, sep="\t", index=False)
         provenance = dict(version=__version__, config=asdict(config), input_rows=len(results), selected_rows=len(signals),
@@ -93,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
                           effect_checkpoint=checkpoint_details,
                           network=dict(enabled=args.network, seed=args.seed, dpi=args.dpi, include_self=args.include_self,
                                        missing_genes=args.missing_genes, node_count=len(nodes) if args.network else 0,
-                                       edge_count=len(edges) if args.network else 0))
+                                       edge_count=len(edges) if args.network else 0, display=network_options(args)))
         Path(str(prefix) + ".selection.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
     except (ValueError, OSError, ImportError, sqlite3.Error) as exc:
         sys.stderr.write(f"Annotation error: {exc}\n")
