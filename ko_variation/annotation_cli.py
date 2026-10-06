@@ -5,6 +5,7 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
+import sqlite3
 import pandas as pd
 from .postprocess import SelectionConfig, select_distal_signals, fit_selected_effects
 from .network import build_gene_network, export_gene_network
@@ -32,7 +33,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--title", default="Distal gene covariation")
+    parser.add_argument("--checkpoint-file", help="Per-pair refit checkpoint [OUT.refit.sqlite]; retained after completion")
+    parser.add_argument("--resume", action="store_true", help="Reuse completed refits from an exactly matching checkpoint")
+    parser.add_argument("--no-checkpoint", action="store_true", help="Disable refit checkpoints")
+    parser.add_argument("--no-progress", action="store_true", help="Suppress stage and refit progress messages")
+    parser.add_argument("--progress-every", type=int, default=10, help="Report after this many newly completed pairs [10]")
+    parser.add_argument("--progress-seconds", type=float, default=60, help="Heartbeat interval, including during a slow fit [60]")
     args = parser.parse_args(argv)
+    if args.resume and args.no_checkpoint:
+        parser.error("--resume cannot be combined with --no-checkpoint")
+    import math
+    if args.progress_every < 1 or not math.isfinite(args.progress_seconds) or args.progress_seconds <= 0:
+        parser.error("Progress intervals must be positive")
     config = SelectionConfig(**{key: getattr(args, key) for key in asdict(SelectionConfig())})
     prefix = Path(args.out)
     target = Path(str(prefix) + ".distal.tsv")
@@ -40,22 +52,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.network:
         destinations += [Path(str(prefix) + suffix) for suffix in (".png", ".html", ".nodes.tsv", ".edges.tsv")]
     inputs = [Path(args.results), Path(args.fasta), Path(args.tree)] + ([Path(args.annotation)] if args.annotation else [])
+    checkpoint_file = None if args.no_checkpoint else Path(args.checkpoint_file or str(prefix) + ".refit.sqlite")
+    if checkpoint_file is not None:
+        destinations.append(checkpoint_file)
     if any(output.resolve() == source.resolve() for output in destinations for source in inputs):
         parser.error("Output paths must not overwrite input files")
     try:
+        def announce(message):
+            if not args.no_progress:
+                print(f"[annotation] {message}", flush=True)
+        announce("reading selected-pair input and annotation")
         results = pd.read_csv(args.results, sep="\t")
         annotation = pd.read_csv(args.annotation, sep="\t", dtype={"gene": str, "contig": str, "label": str, "product": str, "group": str}) if args.annotation else None
         signals = select_distal_signals(results, config, annotation)
+        announce(f"selected {len(signals)} pairs; reading scanner genotypes")
         fasta = read_fake_fasta(args.fasta)
         # Empty selections require no tree covariance or alternative fits.
         if signals.empty:
             import numpy as np
-            signals = fit_selected_effects(signals, fasta.X, np.zeros((0, 0)), confidence=args.confidence)
+            K = np.zeros((0, 0))
         else:
-            print(f"Refitting {len(signals)} selected pairs", flush=True)
+            announce(f"Refitting {len(signals)} selected pairs; preparing phylogenetic covariance")
             K, _ = prepare_kinship(build_tree_covariance(args.tree, fasta.sample_names).K)
-            signals = fit_selected_effects(signals, fasta.X, K, confidence=args.confidence)
+        signals = fit_selected_effects(signals, fasta.X, K, confidence=args.confidence,
+                                       checkpoint_file=checkpoint_file, resume=args.resume,
+                                       progress=not args.no_progress, progress_every=args.progress_every,
+                                       progress_seconds=args.progress_seconds,
+                                       checkpoint_identity=dict(selection=asdict(config)))
+        checkpoint_details = signals.attrs.get("effect_checkpoint", {})
         if args.network:
+            announce("aggregating gene edges and exporting figures")
             nodes, edges = build_gene_network(signals, significance_column="p_primary",
                                              include_self=args.include_self, missing_genes=args.missing_genes)
             export_gene_network(nodes, edges, prefix, seed=args.seed, dpi=args.dpi, title=args.title)
@@ -64,11 +90,12 @@ def main(argv: list[str] | None = None) -> int:
         provenance = dict(version=__version__, config=asdict(config), input_rows=len(results), selected_rows=len(signals),
                           inputs=[str(source.resolve()) for source in inputs], confidence=args.confidence,
                           effect_method="alternative_logistic_mixed_pql", effect_status_counts=signals.effect_status.value_counts().to_dict(),
+                          effect_checkpoint=checkpoint_details,
                           network=dict(enabled=args.network, seed=args.seed, dpi=args.dpi, include_self=args.include_self,
                                        missing_genes=args.missing_genes, node_count=len(nodes) if args.network else 0,
                                        edge_count=len(edges) if args.network else 0))
         Path(str(prefix) + ".selection.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
-    except (ValueError, OSError, ImportError) as exc:
+    except (ValueError, OSError, ImportError, sqlite3.Error) as exc:
         sys.stderr.write(f"Annotation error: {exc}\n")
         return 2
     print(f"Selected {len(signals)} of {len(results)} pairs: {target}")

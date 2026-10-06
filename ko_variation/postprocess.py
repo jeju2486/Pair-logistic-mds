@@ -2,10 +2,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
+import hashlib
+from pathlib import Path
+import platform
 import numpy as np
 import pandas as pd
+import scipy
 from scipy.stats import norm
+from threadpoolctl import threadpool_info
 from .glmm import fit_logistic_mixed, prepare_kinship_eigensystem
+from .effect_checkpoint import EFFECT_COLUMNS, EffectCheckpoint, RefitProgress, array_fingerprint
 
 
 @dataclass(frozen=True)
@@ -124,12 +131,17 @@ def select_distal_signals(results: pd.DataFrame, config: SelectionConfig | None 
 
 
 def fit_selected_effects(signals: pd.DataFrame, X: np.ndarray, K: np.ndarray,
-                         *, confidence: float = 0.95) -> pd.DataFrame:
+                         *, confidence: float = 0.95, checkpoint_file=None,
+                         resume: bool = False, progress: bool = False,
+                         progress_every: int = 10, progress_seconds: float = 60,
+                         checkpoint_identity: dict | None = None) -> pd.DataFrame:
     """Fit u -> v only for selected rows; SE is final working-PQL covariance.
 
     K must be the prepared covariance, aligned to X as in the scanner. The Wald
     interval treats fitted tau as fixed and does not correct post-selection bias.
     """
+    if resume and checkpoint_file is None:
+        raise ValueError("Resume requires a refit checkpoint file")
     if not 0 < confidence < 1:
         raise ValueError("Confidence must lie in (0, 1)")
     _require(signals, ["u", "v", "n11", "n10", "n01", "n00"])
@@ -141,6 +153,8 @@ def fit_selected_effects(signals: pd.DataFrame, X: np.ndarray, K: np.ndarray,
         raise ValueError("Selected locus IDs do not match genotype columns")
     if "n_samples" in result and not result.n_samples.eq(len(X)).all():
         raise ValueError("Sample count differs from original scan")
+    if progress:
+        print(f"[refit] checking genotype counts for {len(result)} selected pairs", flush=True)
     # Check every selected table before performing expensive fits.
     tables = []
     for row in result.itertuples():
@@ -156,33 +170,78 @@ def fit_selected_effects(signals: pd.DataFrame, X: np.ndarray, K: np.ndarray,
     result["effect_message"] = ""
     result["effect_method"] = "alternative_logistic_mixed_pql"
     result["effect_confidence"] = confidence
-    if result.empty:
-        return result
-    eigensystem = prepare_kinship_eigensystem(K)
-    z = norm.ppf((1 + confidence) / 2)
-    for index, row in enumerate(result.itertuples()):
-        if min(tables[index]) == 0:
-            result.loc[result.index[index], "effect_status"] = "SEPARATION_OR_MONOMORPHIC"
-            continue
-        fit, cache = fit_logistic_mixed(X[:, int(row.v)], K,
-                                        covariates=X[:, int(row.u)].reshape(-1, 1),
-                                        kinship_eigensystem=eigensystem)
-        idx = result.index[index]
-        result.loc[idx, ["effect_status", "effect_iterations", "effect_message", "alternative_tau"]] = [fit.status, fit.iterations, fit.message, fit.tau]
-        covariance = cache.get("M_inv")
-        del cache
-        if not fit.converged:
-            continue
-        beta = float(fit.beta[1])
-        variance = float(covariance[1, 1])
-        if fit.n_weights_clipped or not np.isfinite([beta, variance]).all() or variance <= 0:
-            result.loc[idx, "effect_status"] = "UNSTABLE_EFFECT"
-            continue
-        se = np.sqrt(variance)
-        with np.errstate(over="ignore", under="ignore"):
-            odds = np.exp([beta, beta - z * se, beta + z * se])
-        if not np.isfinite(odds).all() or (odds == 0).any():
-            result.loc[idx, "effect_status"] = "UNSTABLE_EFFECT"
-            continue
-        result.loc[idx, ["adjusted_beta", "adjusted_beta_se", "adjusted_odds_ratio", "adjusted_or_ci_low", "adjusted_or_ci_high"]] = [beta, se, *odds]
+    context = nullcontext(None)
+    if checkpoint_file is not None:
+        if progress:
+            print("[refit] fingerprinting genotypes, covariance and fitting settings", flush=True)
+        # Hash values, not file paths, so moving identical inputs is harmless.
+        identity = dict(method="alternative_logistic_mixed_pql", confidence=confidence,
+                        X=array_fingerprint(X), K=array_fingerprint(K),
+                        pairs=array_fingerprint(result[["u", "v", "n11", "n10", "n01", "n00"]].to_numpy(np.int64)),
+                        numpy=np.__version__, scipy=scipy.__version__, machine=platform.machine(),
+                        blas=[{key: item.get(key) for key in ("internal_api", "version", "architecture")}
+                              for item in threadpool_info() if item.get("user_api") == "blas"],
+                        fitting_code={name: hashlib.sha256(Path(__file__).with_name(name).read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+                                      for name in ("postprocess.py", "glmm.py")},
+                        settings=checkpoint_identity or {})
+        context = EffectCheckpoint(checkpoint_file, identity, resume=resume)
+    with context as checkpoint:
+        recovered = checkpoint.load() if checkpoint else {}
+        pair_keys = {(int(row.u), int(row.v)) for row in result.itertuples()}
+        if set(recovered) - pair_keys:
+            raise ValueError("Checkpoint contains pairs outside the selected set")
+        result.attrs["effect_checkpoint"] = dict(enabled=checkpoint is not None,
+                                                 file=str(checkpoint_file) if checkpoint else None,
+                                                 resumed=resume, recovered_pairs=len(recovered),
+                                                 checkpoint_every_pairs=1, retained=True)
+        with RefitProgress(len(result), recovered, enabled=progress,
+                           every=progress_every, seconds=progress_seconds) as reporter:
+            if len(recovered) < len(result):
+                if progress:
+                    print("[refit] preparing shared covariance eigensystem", flush=True)
+                eigensystem = prepare_kinship_eigensystem(K)
+            z = norm.ppf((1 + confidence) / 2)
+            for index, row in enumerate(result.itertuples()):
+                key = (int(row.u), int(row.v))
+                if key in recovered:
+                    payload = recovered[key]
+                else:
+                    reporter.start_pair(*key)
+                    payload = _fit_pair_effect(row, tables[index], X, K, eigensystem, z)
+                    if checkpoint:
+                        checkpoint.record(*key, payload)
+                    reporter.completed(payload["effect_status"])
+                for column in EFFECT_COLUMNS:
+                    result.loc[result.index[index], column] = payload[column]
     return result
+
+
+def _fit_pair_effect(row, table, X, K, eigensystem, z) -> dict:
+    """The existing alternative fit and acceptance criteria, unchanged."""
+    payload = {column: np.nan for column in EFFECT_COLUMNS[:6]}
+    payload.update(effect_status="NOT_FITTED", effect_iterations=0, effect_message="")
+    if min(table) == 0:
+        payload["effect_status"] = "SEPARATION_OR_MONOMORPHIC"
+        return payload
+    fit, cache = fit_logistic_mixed(X[:, int(row.v)], K,
+                                  covariates=X[:, int(row.u)].reshape(-1, 1),
+                                  kinship_eigensystem=eigensystem)
+    payload.update(effect_status=fit.status, effect_iterations=fit.iterations,
+                   effect_message=fit.message, alternative_tau=fit.tau)
+    covariance = cache.get("M_inv")
+    del cache
+    if not fit.converged:
+        return payload
+    beta = float(fit.beta[1])
+    variance = float(covariance[1, 1])
+    if fit.n_weights_clipped or not np.isfinite([beta, variance]).all() or variance <= 0:
+        payload["effect_status"] = "UNSTABLE_EFFECT"
+        return payload
+    se = np.sqrt(variance)
+    with np.errstate(over="ignore", under="ignore"):
+        odds = np.exp([beta, beta - z * se, beta + z * se])
+    if not np.isfinite(odds).all() or (odds == 0).any():
+        payload["effect_status"] = "UNSTABLE_EFFECT"
+        return payload
+    payload.update(zip(EFFECT_COLUMNS[:5], [beta, se, *odds]))
+    return payload

@@ -14,6 +14,67 @@ ko-variation-annotation --results kovar_results/ko_variation.tsv \
 The same command runs as `python -m ko_variation.annotation_cli`. Network exports
 require `pip install -e '.[network]'`; omit `--network` for effects alone.
 
+## Refit checkpoints and progress
+
+The downstream helper now commits every completed pair to `OUT.refit.sqlite`
+by default. Repeat the same command with `--resume` to load those results and
+fit only unfinished pairs. A fit interrupted halfway is restarted, rather than
+resumed from an internal PQL iteration. Saved unsuccessful fits are completed
+attempts and are not retried automatically. The checkpoint is retained after
+successful exports, so a resumed run can regenerate figures without refitting.
+
+```bash
+# First run: ordinary command above, with optional reporting intervals.
+ko-variation-annotation --results kovar_results/ko_variation.tsv \
+  --fasta binary.fa --tree rooted_tree.nwk --annotation loci.tsv \
+  --out downstream/hits --network --progress-every 10 --progress-seconds 60
+
+# Restart with identical inputs and scientific settings.
+ko-variation-annotation --results kovar_results/ko_variation.tsv \
+  --fasta binary.fa --tree rooted_tree.nwk --annotation loci.tsv \
+  --out downstream/hits --network --resume
+```
+
+`--checkpoint-file` overrides the database path. `--no-checkpoint` disables
+checkpointing; it cannot be combined with `--resume`. An existing checkpoint
+requires `--resume` or a new output prefix. No checkpoint is silently replaced.
+Genotype and prepared covariance values, selected pair order/counts, confidence,
+selection settings, fitting-source hashes and numerical library versions must
+match before saved effects are reused. Display settings and gene labels can
+change because they do not change the saved locus-pair fits. SQLite commits
+each completed pair with full synchronization; an OS lock prevents concurrent
+writers and releases automatically when a process exits. Keep the database and
+any SQLite journal together when recovering after a job termination.
+
+Progress is enabled by default. Stage messages distinguish input reading,
+covariance preparation, genotype checks and network export. Pair messages show
+completed/total, percentage, recovered pairs, elapsed time, approximate remaining
+time, current pair and fitting-status counts. A heartbeat prints every
+`--progress-seconds` seconds even during a slow fit. `--progress-every` controls
+additional completion messages; `--no-progress` suppresses reporting. Remaining
+time is estimated from newly completed pairs in the current run and can change
+as pair runtimes vary. Progress is written to stdout and appears in Slurm's
+`.out` log when the job is submitted with `sbatch`.
+
+The supplied `run_kovar_plot_saureus.sh` wrapper defaults to `RESUME=1`: it
+checks stage caches, reuses matching screening/automatic annotation outputs,
+and adds `--resume` when a refit database exists. Upstream cache identities use
+source paths, sizes and nanosecond mtimes (including Bakta file inventories),
+plus full SHA-256 checks of cached output files. Do not edit source contents
+while preserving their timestamps. Refit reuse separately verifies the actual
+genotypes, covariance and fitting configuration. Use a different `PREFIX` for
+a fresh independent run; `RESUME=0` does not delete an existing refit database.
+Only fully completed screening and annotation stages are reused. An interrupted
+screening pass or pyseer annotation stage restarts that stage; per-pair recovery
+applies to coefficient fitting.
+
+Old runs that never wrote refit checkpoints cannot recover unsaved effects.
+For an existing, already completed annotation from the older wrapper, set
+`AUTO_ANNOTATE=0` explicitly to reuse that TSV on the first updated submission.
+Otherwise, its missing cache manifest triggers annotation regeneration once.
+Subsequent updated runs reuse the verified stage cache automatically. The
+current running process cannot acquire these features retroactively.
+
 ## Selection parameters
 
 `--significance-threshold` is the Bonferroni family-wise alpha, **0.05 by default**.
