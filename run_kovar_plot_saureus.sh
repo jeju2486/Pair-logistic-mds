@@ -32,6 +32,12 @@ if [[ ! -s "$GENE_PRESENCE_ABSENCE" ]]; then
 fi
 ANNOTATION_ENV="${ANNOTATION_ENV:-$ROOT/pyseer_annotation_env}"
 ANNOTATION_PYTHON="${ANNOTATION_PYTHON:-$ANNOTATION_ENV/bin/python}"
+# Annotation proximity is independent of the >10 kb pair-selection rule.
+ANNOTATION_NEARBY_BP="${ANNOTATION_NEARBY_BP:-500}"
+if [[ ! "$ANNOTATION_NEARBY_BP" =~ ^[0-9]+$ ]]; then
+    echo "ANNOTATION_NEARBY_BP must be a nonnegative integer" >&2
+    exit 1
+fi
 if [[ -n "${ANNOTATION:-}" ]]; then
     AUTO_ANNOTATE="${AUTO_ANNOTATE:-0}"
 else
@@ -46,8 +52,8 @@ LD_DISTANCE_BP="${LD_DISTANCE_BP:-10000}"
 # Set DISTANCE_COLUMN=distance explicitly if that is your intended distance rule.
 DISTANCE_COLUMN="${DISTANCE_COLUMN:-min_distance}"
 CROSS_CONTIG="${CROSS_CONTIG:-exclude}"
-# Auto-annotation records ambiguous, intergenic and unmapped loci separately.
-# Only resolved CDS mappings enter the gene map; retain all selected pair effects.
+# Auto-annotation records coding, bounded nearby, ambiguous and unmapped loci.
+# Only unambiguous mappings enter the gene map; retain all selected pair effects.
 MISSING_GENES="${MISSING_GENES:-drop}"
 NETWORK_SEED="${NETWORK_SEED:-42}"
 PNG_DPI="${PNG_DPI:-300}"
@@ -87,7 +93,7 @@ else
         exit 1
     fi
 fi
-if [[ ! -s "$KOVAR_REPO/ko_variation/annotation_cli.py" ]]; then
+if [[ ! -s "$KOVAR_REPO/ko_variation/annotation_cli.py" || ! -s "$KOVAR_REPO/ko_variation/locus_annotation.py" ]]; then
     echo "Missing development helper in: $KOVAR_REPO" >&2
     echo 'Clone feature/downstream-helpers and install its [network] extra; see the accompanying instructions.' >&2
     exit 1
@@ -226,9 +232,13 @@ if [[ "$AUTO_ANNOTATE" == "1" ]]; then
     done
     ANNOTATION_CACHE_ARGS=(
         --manifest "$ANNOTATION_CACHE" --stage annotation
-        --inputs "$SCREENED_SCORE" "$FASTA" "$UNITIGS" "$GENE_PRESENCE_ABSENCE"
-        --outputs "$ANNOTATION" --directories "$BAKTA_DIR"
-        --settings "workflow=panaroo_pyseer_exact_v1" "annotation_python=$ANNOTATION_PYTHON"
+        --inputs "$SCREENED_SCORE" "$FASTA" "$UNITIGS" "$GENE_PRESENCE_ABSENCE" \
+                 "$KOVAR_REPO/ko_variation/locus_annotation.py" "$KOVAR_REPO/run_kovar_plot_saureus.sh"
+        --outputs "$ANNOTATION" "$ANNOTATION_DIR/annotation_status.tsv" \
+                  "$ANNOTATION_DIR/gene_catalog.tsv" "$ANNOTATION_DIR/annotation_summary.json"
+        --directories "$BAKTA_DIR"
+        --settings "workflow=panaroo_pyseer_bounded_v2" "annotation_python=$ANNOTATION_PYTHON" \
+                   "annotation_nearby_bp=$ANNOTATION_NEARBY_BP"
     )
     if [[ "$RESUME" == "1" ]] && "$KOVAR_PYTHON" -m ko_variation.workflow_cache check "${ANNOTATION_CACHE_ARGS[@]}"; then
         AUTO_ANNOTATE=0
@@ -247,7 +257,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
-from urllib.parse import unquote
+from ko_variation.locus_annotation import create_geometry, qualify_reference
 import pandas as pd
 from ko_variation.postprocess import SelectionConfig, select_distal_signals
 
@@ -278,7 +288,7 @@ details = {"original_results": screening["original_results"], "selected_input": 
            "undefined_distance_rows": screening["undefined_distance_rows"], "n_tests": screening["n_tests"],
            "unitigs": str(unitigs), "panaroo_clusters": str(gpa),
            "mapping": "pyseer draft/full-length exact match; first matching assembly",
-           "gene_assignment": "all reported hits must overlap one Panaroo cluster"}
+           "gene_assignment": "CDS overlap or bounded strand-aware nearby region; all reported hits must resolve to one cluster"}
 del results, selected
 
 # Unitig IDs are explicit zero-based PAN-GWES column IDs; never infer from GFA names.
@@ -304,6 +314,7 @@ with (work / "queries.tsv").open("w") as handle:
     for locus in loci:
         handle.write(f"{found[locus]}\t{locus}\n")
 (work / "selected_loci.json").write_text(json.dumps(loci))
+geometry = create_geometry(work / "gene_geometry.sqlite")
 with (work / "references.txt").open("w") as references:
     if loci:
         sample_names = []
@@ -348,42 +359,10 @@ with (work / "references.txt").open("w") as references:
             for feature, cluster in membership_db.execute("SELECT feature, cluster FROM membership WHERE sample = ?", (sample,)):
                 members.setdefault(feature, set()).add(cluster)
             reference_dir = work / "references" / str(index)
-            reference_dir.mkdir(parents=True, exist_ok=True)
-            mapped_gff = reference_dir / "genes.gff"
-            cds_count = 0
-            mapped_cds_count = 0
-            with raw_gff.open() as source, mapped_gff.open("w") as target:
-                target.write("##gff-version 3\n")
-                for line in source:
-                    if line.startswith("##FASTA"):
-                        break
-                    fields = line.rstrip("\n").split("\t")
-                    if len(fields) != 9 or fields[2] != "CDS":
-                        continue
-                    attributes = dict(item.split("=", 1) for item in fields[8].split(";") if "=" in item)
-                    feature_id = unquote(attributes.get("ID", ""))
-                    clusters = members.get(feature_id, set())
-                    if not clusters:
-                        # Main Panaroo CSV can append QC flags to original feature IDs.
-                        clusters = members.get(feature_id + "_len", set()) | members.get(feature_id + "_pseudo", set()) | members.get(feature_id + "_len_pseudo", set())
-                    if len(clusters) == 1:
-                        cluster = next(iter(clusters))
-                        mapped_cds_count += 1
-                    else:
-                        # Keep unresolved CDS features visible to overlap tests;
-                        # removing them could create a false unambiguous mapping.
-                        cluster = f"__UNRESOLVED_CDS_{index}_{cds_count}"
-                    if any(char in cluster for char in ";|,\t\n"):
-                        raise SystemExit(f"Unsupported delimiter in Panaroo cluster ID: {cluster}")
-                    attributes["gene"] = cluster
-                    fields[8] = ";".join(f"{key}={value}" for key, value in attributes.items())
-                    target.write("\t".join(fields) + "\n")
-                    cds_count += 1
+            linked_fasta, mapped_gff, mapped_cds_count = qualify_reference(
+                raw_fasta, raw_gff, reference_dir, sample, index, members, gene_metadata, geometry)
             if not mapped_cds_count:
                 continue
-            # Isolated index files do not modify the Bakta output directories.
-            linked_fasta = reference_dir / "assembly.fna"
-            linked_fasta.symlink_to(raw_fasta.resolve())
             if any(char.isspace() for char in str(linked_fasta) + str(mapped_gff)):
                 raise SystemExit("Pyseer reference paths must not contain whitespace")
             references.write(f"{linked_fasta.absolute()}\t{mapped_gff.absolute()}\tdraft\n")
@@ -393,6 +372,8 @@ with (work / "references.txt").open("w") as references:
             raise SystemExit("No Bakta CDS IDs matched Panaroo clusters for the scanner samples")
         details["reference_count"] = reference_count
         (work / "gene_metadata.json").write_text(json.dumps(gene_metadata))
+geometry.commit()
+geometry.close()
 (work / "annotation_preparation.json").write_text(json.dumps(details, indent=2))
 print(f"Annotation preparation: {len(loci)} loci from {details['selected_pairs']} distal pairs")
 PY
@@ -423,69 +404,21 @@ PY
         : > "$ANNOTATION_WORK/pyseer_hits.tsv"
     fi
 
-    "$KOVAR_PYTHON" - "$ANNOTATION_WORK" "$ANNOTATION" <<'PY'
-import csv
-from collections import Counter
-import json
-from pathlib import Path
-import sys
-
-work, output = map(Path, sys.argv[1:])
-loci = json.loads((work / "selected_loci.json").read_text())
-metadata_path = work / "gene_metadata.json"
-metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-assigned = {}
-raw_hits = {}
-with (work / "pyseer_hits.tsv").open() as handle:
-    for line in handle:
-        fields = line.rstrip("\n").split("\t")
-        if len(fields) != 3:
-            raise SystemExit("Unexpected pyseer annotation output; expected sequence, locus, annotations")
-        locus = int(fields[1])
-        if locus in raw_hits:
-            raise SystemExit(f"Duplicate pyseer output for locus {locus}")
-        raw_hits[locus] = fields[2]
-        genes = set()
-        has_intergenic_hit = False
-        for hit in fields[2].split(","):
-            annotation = hit.split(";")
-            if len(annotation) != 4:
-                raise SystemExit(f"Unexpected hit annotation for locus {locus}")
-            inside = set(filter(None, annotation[2].split("|")))
-            has_intergenic_hit |= not inside
-            genes.update(inside)
-        if len(genes) == 1 and not has_intergenic_hit and next(iter(genes)) in metadata:
-            assigned[locus] = next(iter(genes))
-        elif not genes:
-            assigned[locus] = None
-        else:
-            assigned[locus] = False
-
-counts = Counter()
-with output.open("w", newline="") as handle, (work / "annotation_status.tsv").open("w", newline="") as audit:
-    writer = csv.writer(handle, delimiter="\t")
-    writer.writerow(["locus", "gene", "label", "product", "group"])
-    audit_writer = csv.writer(audit, delimiter="\t")
-    audit_writer.writerow(["locus", "status", "gene", "pyseer_hits"])
-    for locus in loci:
-        gene = assigned.get(locus)
-        status = "UNMAPPED" if locus not in raw_hits else "INTERGENIC" if gene is None else "AMBIGUOUS" if gene is False else "RESOLVED"
-        counts[status] += 1
-        audit_writer.writerow([locus, status, gene or "", raw_hits.get(locus, "")])
-        if status == "RESOLVED":
-            values = metadata.get(gene, {})
-            writer.writerow([locus, gene, values.get("label", gene), values.get("product", ""), "Panaroo cluster"])
-summary = json.loads((work / "annotation_preparation.json").read_text())
-summary["annotation_status_counts"] = dict(counts)
-summary["output_annotation"] = str(output)
-summary["coordinates"] = "omitted: different draft assemblies are not a shared coordinate system"
-(work / "annotation_summary.json").write_text(json.dumps(summary, indent=2))
-print("Annotation status counts:", dict(counts))
-print("Generated locus-to-gene mapping:", output)
-PY
+    "$KOVAR_PYTHON" -m ko_variation.locus_annotation \
+        --work "$ANNOTATION_WORK" --out "$ANNOTATION" --nearby-bp "$ANNOTATION_NEARBY_BP"
+    cp "$ANNOTATION_WORK/annotation_status.tsv" "$ANNOTATION_DIR/annotation_status.tsv"
+    cp "$ANNOTATION_WORK/gene_catalog.tsv" "$ANNOTATION_DIR/gene_catalog.tsv"
+    cp "$ANNOTATION_WORK/annotation_summary.json" "$ANNOTATION_DIR/annotation_summary.json"
+    echo "Gene inventory (all Panaroo clusters): $ANNOTATION_WORK/gene_catalog.tsv"
     echo "Annotation details: $ANNOTATION_WORK/annotation_summary.json"
     echo "Unresolved annotation table: $ANNOTATION_WORK/annotation_status.tsv"
     "$KOVAR_PYTHON" -m ko_variation.workflow_cache store "${ANNOTATION_CACHE_ARGS[@]}"
+fi
+
+if [[ -s "$ANNOTATION_DIR/annotation_summary.json" ]]; then
+    echo "Current annotation audit: $ANNOTATION_DIR/annotation_status.tsv"
+    echo "Current gene inventory: $ANNOTATION_DIR/gene_catalog.tsv"
+    echo "Current annotation summary: $ANNOTATION_DIR/annotation_summary.json"
 fi
 
 if [[ ! -s "$ANNOTATION" ]]; then
@@ -513,8 +446,8 @@ printf 'Bonferroni alpha: %s; distance: %s > %s bp; cross-contig: %s\n' \
     "$BONFERRONI_ALPHA" "$DISTANCE_COLUMN" "$LD_DISTANCE_BP" "$CROSS_CONTIG"
 printf 'source\t%s\ncommit\t%s\nannotation\t%s\n' \
     "$KOVAR_REPO" "$REVISION" "$ANNOTATION" > "$PREFIX.source.tsv"
-printf 'auto_annotation\t%s\nannotation_work\t%s\n' \
-    "$AUTO_ANNOTATE" "${ANNOTATION_WORK:-not_applicable}" >> "$PREFIX.source.tsv"
+printf 'auto_annotation\t%s\nannotation_work\t%s\nannotation_nearby_bp\t%s\n' \
+    "$AUTO_ANNOTATE" "${ANNOTATION_WORK:-not_applicable}" "$ANNOTATION_NEARBY_BP" >> "$PREFIX.source.tsv"
 
 # Selection uses original screening P-values. Only selected pairs are refitted.
 # Keep failed-effect pairs in the exports; beta does not select network edges.

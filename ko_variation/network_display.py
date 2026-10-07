@@ -174,6 +174,9 @@ def export_gene_network(nodes, edges, prefix, *, seed=42, dpi=300, title="Distal
         ("display_label", [short_label(row.label, row.gene) for row in nodes.itertuples()])):
         node_display[name] = values
     node_display["color"] = NODE_COLOR
+    if "n_coding_loci" in nodes and "n_nearby_loci" in nodes:
+        nearby_only = nodes.n_coding_loci.eq(0) & nodes.n_nearby_loci.gt(0) & node_display.display_label.ne("")
+        node_display.loc[nearby_only, "display_label"] = "near " + node_display.loc[nearby_only, "display_label"]
     fig_width = max(6, min(14, width/100))
     fig_height = max(3.5, fig_width * height/width) + 0.7
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))

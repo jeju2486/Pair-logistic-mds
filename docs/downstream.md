@@ -145,6 +145,69 @@ An empty selection skips covariance construction and alternative fitting.
 
 ## Gene networks
 
+### Coding and bounded nearby annotations
+
+The plotting wrapper annotates selected unitigs uniformly across genes. It uses
+pyseer's full-length exact draft-assembly matches and Bakta CDS coordinates mapped
+to Panaroo clusters. `ANNOTATION_NEARBY_BP=500` is the default; set it to `0` for
+coding overlaps only. The annotation window is independent of `LD_DISTANCE_BP=10000`:
+the latter still selects original locus pairs with PAN-GWES minimum separation
+strictly greater than 10 kb. Neither gene coordinates nor annotation distances
+replace that distance or change the original statistical threshold.
+
+A hit overlapping a CDS receives `coding` and distance zero. For an intergenic
+hit, all CDS features on the same contig within the specified window are considered.
+`upstream` and `downstream` follow the CDS strand. Distances use the nearest
+hit/CDS endpoints in one-based inclusive coordinates: adjacent bases are 1 bp
+apart. Coordinates are read directly from BWA hit intervals and GFF, rather than
+inferring distances or transcriptional direction from pyseer's nearest-gene names.
+The helper checks all reported hits in the first matching draft assembly;
+pyseer does not establish consistent annotation across all isolates. Each assembly's
+contig identifiers are qualified in temporary copies of FASTA and GFF to prevent
+collisions between commonly reused names such as `contig_1`. Original reference
+and contig identifiers remain in the annotation evidence. Bakta files are unchanged.
+
+A locus enters the mapping only when every reported hit resolves to the same
+known cluster. Multiple candidate clusters, unresolved CDS overlaps/flanks,
+unknown nearby-gene strand, or a mixture of assignable and unassignable hits remain
+ambiguous. A CDS overlap takes priority over adjacent CDS features. Unmapped and
+out-of-window intergenic loci remain unassigned. Multiple copies of the same
+Panaroo cluster can still collapse to one node; the mapping retains hit counts and
+reference coordinates. Nearby annotation indicates proximity, not regulation,
+causation or a demonstrated variant within that gene.
+
+```bash
+cd /data/biol-micro-genomics/kell7366/kovar/Pair-logistic-mds
+git pull --ff-only origin feature/downstream-helpers
+ANNOTATION_NEARBY_BP=500 LD_DISTANCE_BP=10000 AUTO_ANNOTATE=1 RESUME=1 \
+  sbatch --export=ALL run_kovar_plot_saureus.sh
+```
+
+Use `AUTO_ANNOTATE=1` to regenerate an older supplied annotation. The new workflow
+identity invalidates the coding-only annotation cache once. Matching screening
+and refit checkpoints remain reusable; annotation labels do not change locus-pair
+fits. `REDRAW_ONLY=1` uses the annotation already in the effect table and therefore
+does **not** apply a new annotation window. An annotation-only rerun on a prepared
+directory is available as:
+
+```bash
+python -m ko_variation.locus_annotation --work covariation_map/annotation/run.XXXXXXXX \
+  --out locus_to_gene.tsv --nearby-bp 500
+```
+
+This requires the new `gene_geometry.sqlite`, metadata and pyseer hit files;
+older prepared directories must be regenerated once. No new dependencies are
+required beyond the wrapper's existing pyseer/BWA/bedtools/BEDOPS environment.
+Inspect `covariation_map/annotation/gene_catalog.tsv` for the full Panaroo gene
+list, `annotation_status.tsv` for every selected locus, and `annotation_summary.json`
+for counts and the annotation rule. Each work directory also retains these files.
+Resolved mappings carry annotation classes, distance ranges, hit counts and JSON
+evidence through the selected-pair TSV. Network nodes and edges summarize coding
+versus nearby support in their TSVs and HTML hover panels; nearby-only named nodes
+display `near [gene]`. Coding and nearby locus counts can overlap when one locus
+has different classes across its reported hits. Missing genes are never inserted
+into the selected network simply because they are established determinants.
+
 Annotation is TSV with one row per zero-based `locus` and stable nonempty `gene`.
 Optional `label`, `product`, and `group` annotate nodes. Resolve one-to-many locus
 mappings beforehand; duplicate locus mappings are rejected. Gene IDs shared
