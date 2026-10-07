@@ -43,6 +43,10 @@ def parse_args(argv=None):
 
     input_group = parser.add_argument_group("input and filtering")
     input_group.add_argument(
+        "--tree-missing-samples", choices=["error", "drop"], default="error",
+        help="Missing FASTA isolates in tree: error [default] or explicitly drop them.",
+    )
+    input_group.add_argument(
         "--min-maf",
         type=float,
         default=0.05,
@@ -153,6 +157,8 @@ def _checkpoint_identity(
         "settings": {
             "binary_encoding": "A=0,C=1",
             "tree_missing_length": args.tree_missing_length,
+            **({"tree_missing_samples": args.tree_missing_samples}
+               if args.tree_missing_samples != "error" else {}),
             "min_maf": args.min_maf,
             "min_cell_count": args.min_cell_count,
             "graph_count_fraction": 0.05,
@@ -219,6 +225,31 @@ def main(argv=None):
     _step(started, "read_fasta", f"samples={n_samples} loci={n_loci}")
 
     stage_started = time.monotonic()
+    _step(started, "build_covariance", "source=tree")
+    kinship = build_tree_covariance(
+        args.tree,
+        fasta.sample_names,
+        dtype="float64",
+        missing_length=args.tree_missing_length,
+        missing_samples=args.tree_missing_samples,
+    )
+    input_sample_names = fasta.sample_names
+    if kinship.excluded_samples:
+        X = X[kinship.sample_indices, :]
+        fasta.X = X
+        fasta.sample_names = [input_sample_names[i] for i in kinship.sample_indices]
+    n_samples = X.shape[0]
+    K, kdiag = prepare_kinship(kinship.K)
+    del kinship.K
+    stage_seconds["build_covariance"] = time.monotonic() - stage_started
+    _step(
+        started,
+        "build_covariance",
+        f"source={kinship.source} rank={kdiag.rank}/{n_samples} "
+        f"eig_min={kdiag.eigen_min:.3g} eig_max={kdiag.eigen_max:.3g}",
+    )
+
+    stage_started = time.monotonic()
     _step(started, "read_pairs")
     pairs = validate_pairs(
         read_pairs(args.pairs),
@@ -229,24 +260,6 @@ def main(argv=None):
         raise SystemExit("No candidate pairs remain after input validation")
     stage_seconds["read_pairs"] = time.monotonic() - stage_started
     _step(started, "read_pairs", f"pairs={len(pairs)}")
-
-    stage_started = time.monotonic()
-    _step(started, "build_covariance", "source=tree")
-    kinship = build_tree_covariance(
-        args.tree,
-        fasta.sample_names,
-        dtype="float64",
-        missing_length=args.tree_missing_length,
-    )
-    K, kdiag = prepare_kinship(kinship.K)
-    del kinship.K
-    stage_seconds["build_covariance"] = time.monotonic() - stage_started
-    _step(
-        started,
-        "build_covariance",
-        f"source={kinship.source} rank={kdiag.rank}/{n_samples} "
-        f"eig_min={kdiag.eigen_min:.3g} eig_max={kdiag.eigen_max:.3g}",
-    )
 
     memory_estimate = estimate_scan_memory(
         n_samples=n_samples,
@@ -377,6 +390,12 @@ def main(argv=None):
     metadata_path = out / "execution_metadata.tsv"
     _atomic_dataframe_write(results, result_path)
     _atomic_dataframe_write(response_models, model_path)
+    retained_samples = set(fasta.sample_names)
+    _atomic_dataframe_write(pd.DataFrame({
+        "sample": input_sample_names,
+        "status": ["included" if name in retained_samples else "excluded_missing_tree"
+                   for name in input_sample_names],
+    }), out / "sample_inclusion.tsv")
     stage_seconds["write_primary_outputs"] = time.monotonic() - stage_started
     tested = int(np.isfinite(results["p_primary"].to_numpy(dtype=np.float64)).sum())
 
@@ -388,6 +407,10 @@ def main(argv=None):
         "model\tunordered_logistic_mixed_model_pql_score",
         "interpretation\tphylogeny_adjusted_covariation_significance_not_effect_size",
         f"n_samples\t{n_samples}",
+        f"n_input_samples\t{len(input_sample_names)}",
+        f"n_excluded_samples\t{len(kinship.excluded_samples)}",
+        f"tree_missing_samples\t{args.tree_missing_samples}",
+        "sample_inclusion\tsample_inclusion.tsv",
         f"n_loci\t{n_loci}",
         f"n_input_pairs\t{len(pairs)}",
         f"n_pair_rows\t{len(results)}",
@@ -411,6 +434,7 @@ def main(argv=None):
 
     metadata_rows: list[dict[str, object]] = []
     metadata_rows.extend(_metadata_rows("configuration", {
+        "tree_missing_samples": args.tree_missing_samples,
         "unordered_pairs": 1,
         "graph_count_fraction": 0.05,
         "min_maf": args.min_maf,

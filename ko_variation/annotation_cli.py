@@ -22,6 +22,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="Output prefix; must differ from input")
     parser.add_argument("--fasta", required=True, help="Original scanner binary FASTA")
     parser.add_argument("--tree", required=True, help="Original rooted tree with branch lengths")
+    parser.add_argument("--tree-missing-samples", choices=["error", "drop"], default="error",
+                        help="Use the same missing-isolate policy as the scanner [error]")
     parser.add_argument("--annotation", help="TSV: locus, gene; optional contig, position, label, product, group")
     parser.add_argument("--significance-threshold", type=float, default=0.05, help="Bonferroni family-wise alpha; cutoff is alpha / original n_tests (default: 0.05)")
     parser.add_argument("--ld-distance", type=float, default=0, help="Exclude distances <= cutoff (default: 0); physical-distance proxy for linkage")
@@ -69,18 +71,32 @@ def main(argv: list[str] | None = None) -> int:
         signals = select_distal_signals(results, config, annotation)
         announce(f"selected {len(signals)} pairs; reading scanner genotypes")
         fasta = read_fake_fasta(args.fasta)
+        sample_provenance = dict(policy=args.tree_missing_samples,
+                                 n_input_samples=len(fasta.sample_names),
+                                 n_samples=len(fasta.sample_names), excluded_samples=[],
+                                 matching_performed=False)
         # Empty selections require no tree covariance or alternative fits.
         if signals.empty:
             import numpy as np
             K = np.zeros((0, 0))
         else:
             announce(f"Refitting {len(signals)} selected pairs; preparing phylogenetic covariance")
-            K, _ = prepare_kinship(build_tree_covariance(args.tree, fasta.sample_names).K)
+            kinship = build_tree_covariance(args.tree, fasta.sample_names,
+                                           missing_samples=args.tree_missing_samples)
+            if kinship.excluded_samples:
+                fasta.X = fasta.X[kinship.sample_indices, :]
+                fasta.sample_names = [fasta.sample_names[i] for i in kinship.sample_indices]
+            sample_provenance.update(n_samples=len(fasta.sample_names),
+                                     excluded_samples=kinship.excluded_samples,
+                                     matching_performed=True)
+            K, _ = prepare_kinship(kinship.K)
         signals = fit_selected_effects(signals, fasta.X, K, confidence=args.confidence,
                                        checkpoint_file=checkpoint_file, resume=args.resume,
                                        progress=not args.no_progress, progress_every=args.progress_every,
                                        progress_seconds=args.progress_seconds,
-                                       checkpoint_identity=dict(selection=asdict(config)))
+                                       checkpoint_identity=dict(selection=asdict(config),
+                                           **({"tree_missing_samples": args.tree_missing_samples}
+                                              if args.tree_missing_samples != "error" else {})))
         checkpoint_details = signals.attrs.get("effect_checkpoint", {})
         if args.network:
             announce("aggregating gene edges and exporting figures")
@@ -93,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
                           inputs=[str(source.resolve()) for source in inputs], confidence=args.confidence,
                           effect_method="alternative_logistic_mixed_pql", effect_status_counts=signals.effect_status.value_counts().to_dict(),
                           effect_checkpoint=checkpoint_details,
+                          samples=sample_provenance,
                           network=dict(enabled=args.network, seed=args.seed, dpi=args.dpi, include_self=args.include_self,
                                        missing_genes=args.missing_genes, node_count=len(nodes) if args.network else 0,
                                        edge_count=len(edges) if args.network else 0, display=network_options(args)))

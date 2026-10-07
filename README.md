@@ -57,6 +57,22 @@ KOVAR.
 `--tree` must be a rooted Newick tree with branch lengths. Tip labels must match
 FASTA sample names exactly. KOVAR does not build a fallback GRM in 0.8.3.
 
+By default, a FASTA sample absent from the tree stops the run before candidate
+pairs are loaded. To deliberately analyze the intersection, add
+`--tree-missing-samples drop`. KOVAR retains matched isolates in FASTA order,
+requires at least two, and recalculates locus frequencies, joint tables and
+sample-count-dependent thresholds using those isolates. Locus IDs and candidate
+rows retain their original meanings; input graph `count` metadata is preserved
+and is not recomputed from the subset. Tree tips absent from FASTA are ignored.
+This is an analysis of the retained cohort, not a reconstruction of missing
+phylogenetic placements. Check for naming mismatches before choosing exclusion.
+
+`sample_inclusion.tsv` lists every input isolate and its inclusion status;
+`run_summary.txt` records input, retained and excluded counts and the policy.
+The policy is included in checkpoint identity for subset runs. Repeat the same
+policy on resume and when running `ko-variation-annotation` with the original
+FASTA/tree so that selected effects use the same isolates as screening.
+
 ## How the calculation works
 
 For the deterministic computational orientation `u -> v`, KOVAR fits the null
@@ -104,6 +120,8 @@ last two thresholds. The graph-count fraction is fixed at 0.05 in this release.
 - `run_summary.txt`: short scientific run contract.
 - `execution_metadata.tsv`: timing, memory, runtime, kinship, cache, and
   checkpoint diagnostics.
+- `sample_inclusion.tsv`: input isolate names with `included` or
+  `excluded_missing_tree` status.
 
 `p_primary` is a significance measure, not the magnitude of covariation.
 `primary_method` says whether it came from the normal score approximation or a

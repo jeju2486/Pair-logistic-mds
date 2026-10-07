@@ -108,6 +108,13 @@ Selected joint counts are checked against the supplied genotypes before refits.
 This check cannot prove the supplied tree or sample-locus assignments are the
 original ones; a TSV alone does not contain those provenance fingerprints.
 
+If screening used `--tree-missing-samples drop`, repeat that option here with
+the same original FASTA and tree. The helper applies the identical intersection
+in FASTA order before checking joint counts or fitting effects. Its
+`.selection.json` records the policy, retained count and excluded names. The
+policy also participates in refit checkpoint identity. An empty selection skips
+tree matching and fitting; its provenance marks `matching_performed` as false.
+
 For each selected canonical pair `u < v`, the alternative is:
 
 ```text

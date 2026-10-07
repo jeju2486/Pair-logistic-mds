@@ -120,6 +120,30 @@ class DownstreamResumeTests(unittest.TestCase):
             self.assertEqual(provenance['effect_checkpoint']['recovered_pairs'], 1)
             self.assertEqual(provenance['selected_rows'], 1)
 
+    def test_cli_uses_scanner_sample_intersection_for_refits(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            X = np.repeat(np.array(list(product([0, 1], repeat=2)), dtype=np.uint8), 4, axis=0)
+            fasta, tree, score = [folder / name for name in ('binary.fa', 'tree.nwk', 'score.tsv')]
+            fasta.write_text('>missing\nCC\n' + ''.join(
+                f'>s{i}\n' + ''.join('C' if state else 'A' for state in row) + '\n'
+                for i, row in enumerate(X)))
+            tree.write_text('(' + ','.join(f's{i}:1' for i in reversed(range(len(X)))) + ');')
+            pd.DataFrame(dict(u=[0], v=[1], n11=[4], n10=[4], n01=[4], n00=[4],
+                              status=['OK'], p_primary=[1e-8], distance=[20000], n_tests=[100],
+                              n_samples=[16])).to_csv(score, sep='\t', index=False)
+            prefix = folder / 'output'
+            args = ['--results', str(score), '--fasta', str(fasta), '--tree', str(tree),
+                    '--out', str(prefix), '--tree-missing-samples', 'drop', '--no-progress']
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(annotation_main(args), 0)
+                with patch.object(postprocess, '_fit_pair_effect', side_effect=AssertionError('must reuse saved fit')):
+                    self.assertEqual(annotation_main(args + ['--resume']), 0)
+            provenance = json.loads(Path(str(prefix) + '.selection.json').read_text())
+            self.assertEqual(provenance['samples']['n_samples'], 16)
+            self.assertEqual(provenance['samples']['excluded_samples'], ['missing'])
+            self.assertEqual(provenance['effect_checkpoint']['recovered_pairs'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()
