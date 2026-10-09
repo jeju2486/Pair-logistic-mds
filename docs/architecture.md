@@ -30,7 +30,8 @@ Pair-logistic-mds/
 |   |-- network_display.py   # shared PNG/SVG/offline D3 layout and display
 |   |-- network_cli.py       # redraw saved effects without refitting
 |   |-- workflow_cache.py    # shared completed-stage cache
-|   `-- trace_tet.py         # read-only determinant tracing
+|   |-- amr_report.py        # read-only phenotype/determinant/network report
+|   `-- data/amr_determinants.tsv # curated species/drug mappings with sources
 |-- tests/
 `-- run_kovar_v083_*.sh
 ```
@@ -68,12 +69,13 @@ The public commands accept explicit paths and have no ARC scheduler assumptions.
 `ko-variation-select` streams a full result table into a small selected table.
 `ko-variation-map-loci` prepares and resolves DNA annotations.
 `ko-variation-annotation` estimates selected effects and exports networks.
-`ko-variation-network` redraws saved effects, while `ko-variation-trace-tet`
-diagnoses target coverage using the original full scan. Completed-stage caching
+`ko-variation-network` redraws saved effects. `ko-variation-amr-report` joins
+metadata, annotation labels and an existing selected network without fitting.
+Completed-stage caching
 is shared; numerical effect checkpoints remain separate. The R-backed distance
 plot is still available through `ko-variation-plot` and is not a network export.
 
 ARC-specific submission scripts and their wrapper-only cache CLI were removed.
 The portable v0.8.3 example runners remain because they contain no account paths
-or scheduler settings. AMR catalogue construction is future work and is not
-introduced by this cleanup.
+or scheduler settings. AMR reporting uses a bundled, incomplete starter catalogue
+or an explicitly supplied custom catalogue. Mutation calling remains deferred.

@@ -312,6 +312,10 @@ effects = fit_selected_effects(signals, X, prepared_K)
 
 `X` is the original sample-by-locus binary matrix and `prepared_K` is the aligned
 covariance prepared by `ko_variation.glmm.prepare_kinship`.
+
+After network export, [species-specific AMR reporting](amr_report.md) joins
+metadata phenotypes, curated presence/absence determinant annotation labels and
+the selected network. It requires no refitting and leaves the map unchanged.
 Run `python examples/downstream/reproduce.py` for a synthetic star-tree example
 with scanner output, alternative fits, and network exports. Minimal focused
 checks: `python -m unittest discover -s tests -p test_postprocess.py`.

@@ -30,11 +30,11 @@ ko-variation-annotation = "ko_variation.annotation_cli:main"
 ko-variation-select = "ko_variation.selection_cli:main"
 ko-variation-map-loci = "ko_variation.annotation_inputs:main"
 ko-variation-network = "ko_variation.network_cli:main"
-ko-variation-trace-tet = "ko_variation.trace_tet:main"
+ko-variation-amr-report = "ko_variation.amr_report:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ko_variation*"]
 
 [tool.setuptools.package-data]
-ko_variation = ["scripts/*.R", "templates/*.html", "vendor/*.js", "vendor/*LICENSE*"]
+ko_variation = ["scripts/*.R", "templates/*.html", "vendor/*.js", "vendor/*LICENSE*", "data/*.tsv"]

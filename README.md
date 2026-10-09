@@ -150,11 +150,14 @@ Portable commands replace the former ARC submission wrappers:
 - `ko-variation-select`: select a large full scan in chunks without changing n_tests.
 - `ko-variation-map-loci`: map selected DNA unitigs to Bakta/Panaroo annotations.
 - `ko-variation-network`: redraw completed effects without refitting.
-- `ko-variation-trace-tet`: trace tet unitigs through the original candidate/scan filters.
+- `ko-variation-amr-report`: link species-specific MIC availability, established
+  presence/absence determinant labels, and representation in a selected distal map.
 
 The documented [portable pipeline](docs/downstream.md#portable-workflow-for-large-pan-gwes-scans)
 uses explicit paths and retains selection, annotation and refit recovery.
-See [tet tracing](docs/tet_tracing.md) for the diagnostic command.
+See [AMR reporting](docs/amr_report.md) for the curated catalogue, annotation-name
+matching, and direct/second-order neighbour report. The tet-specific tracer has
+been removed; its old commands are no longer supported.
 After updating an existing checkout, rerun `pip install -e '.[network]'` to
 register the new helper commands. Existing scanner commands are unchanged.
 
