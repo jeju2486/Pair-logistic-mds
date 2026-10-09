@@ -14,6 +14,7 @@ from . import __version__
 from .io_utils import read_fake_fasta
 from .kinship import build_tree_covariance
 from .glmm import prepare_kinship
+from .workflow_cache import cache_matches
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -67,6 +68,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[annotation] {message}", flush=True)
         announce("reading selected-pair input and annotation")
         results = pd.read_csv(args.results, sep="\t")
+        # A preselected TSV retains n_tests; carry the full-scan provenance too.
+        screening = None
+        selection_manifest = Path(str(args.results) + ".selection.json")
+        if selection_manifest.is_file():
+            saved = json.loads(selection_manifest.read_text(encoding="utf-8"))
+            if "cache_identity" in saved and "original_results" in saved:
+                if not cache_matches(selection_manifest, saved["cache_identity"], [args.results]):
+                    raise ValueError("Selected TSV does not match its selection manifest")
+                screening = saved
         annotation = pd.read_csv(args.annotation, sep="\t", dtype={"gene": str, "contig": str, "label": str, "product": str, "group": str}) if args.annotation else None
         signals = select_distal_signals(results, config, annotation)
         announce(f"selected {len(signals)} pairs; reading scanner genotypes")
@@ -105,7 +115,9 @@ def main(argv: list[str] | None = None) -> int:
             export_gene_network(nodes, edges, prefix, seed=args.seed, dpi=args.dpi, title=args.title, **network_options(args))
         prefix.parent.mkdir(parents=True, exist_ok=True)
         signals.to_csv(target, sep="\t", index=False)
-        provenance = dict(version=__version__, config=asdict(config), input_rows=len(results), selected_rows=len(signals),
+        provenance = dict(version=__version__, config=asdict(config),
+                          input_rows=screening["input_rows"] if screening else len(results),
+                          selected_input_rows=len(results), screening=screening, selected_rows=len(signals),
                           inputs=[str(source.resolve()) for source in inputs], confidence=args.confidence,
                           effect_method="alternative_logistic_mixed_pql", effect_status_counts=signals.effect_status.value_counts().to_dict(),
                           effect_checkpoint=checkpoint_details,

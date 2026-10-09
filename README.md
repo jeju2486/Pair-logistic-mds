@@ -14,7 +14,8 @@ See [downstream usage and interpretation](docs/downstream.md).
 ## Installation
 
 ```bash
-git clone https://github.com/jeju2486/Pair-logistic-mds.git
+git clone --branch feature/downstream-helpers https://github.com/jeju2486/Pair-logistic-mds.git
+cd Pair-logistic-mds
 pip install -e .
 ko-variation --version
 ```
@@ -144,6 +145,19 @@ original FASTA and tree. Outputs include adjusted ORs and approximate PQL Wald
 CIs, fit diagnostics, a 300-DPI PNG, editable SVG, offline D3 HTML, saved layout coordinates, and node/edge tables;
 gene edges summarize covariation candidates, not proven functional interactions.
 Run `python examples/downstream/reproduce.py` for a synthetic reproducible example.
+Portable commands replace the former ARC submission wrappers:
+
+- `ko-variation-select`: select a large full scan in chunks without changing n_tests.
+- `ko-variation-map-loci`: map selected DNA unitigs to Bakta/Panaroo annotations.
+- `ko-variation-network`: redraw completed effects without refitting.
+- `ko-variation-trace-tet`: trace tet unitigs through the original candidate/scan filters.
+
+The documented [portable pipeline](docs/downstream.md#portable-workflow-for-large-pan-gwes-scans)
+uses explicit paths and retains selection, annotation and refit recovery.
+See [tet tracing](docs/tet_tracing.md) for the diagnostic command.
+After updating an existing checkout, rerun `pip install -e '.[network]'` to
+register the new helper commands. Existing scanner commands are unchanged.
+
 Full options, failed-fit handling, coordinate fallback, and aggregation rules are
 documented in [docs/downstream.md](docs/downstream.md).
 
@@ -218,7 +232,7 @@ Introduced the experimental logistic mixed-model score scanner.
 Completed downstream results can be redrawn without annotation or refitting:
 
 ```bash
-python -m ko_variation.network_cli --effects downstream/hits.distal.tsv --out downstream/hits
+ko-variation-network --effects downstream/hits.distal.tsv --out downstream/hits
 ```
 
 The compact map uses capped node radii, packed connected components, representative

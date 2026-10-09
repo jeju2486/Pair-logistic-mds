@@ -16,6 +16,8 @@ from urllib.parse import unquote
 import numpy as np
 import pandas as pd
 
+from .workflow_cache import cache_matches, save_cache, stage_identity
+
 
 def announce(message):
     print(f"[tet trace] {message}", flush=True)
@@ -47,27 +49,9 @@ def tet_names(text):
 
 
 def signature(paths, settings):
-    files = []
-    for path in paths:
-        path = Path(path).resolve()
-        stat = path.stat()
-        files.append([str(path), stat.st_size, stat.st_mtime_ns])
-    return dict(files=files, settings=settings,
-                source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
-
-
-def cache_matches(manifest, identity, outputs):
-    if not manifest.is_file() or any(not p.is_file() for p in outputs):
-        return False
-    try:
-        saved = json.loads(manifest.read_text())
-        return saved == signature(outputs, identity)
-    except (ValueError, OSError):
-        return False
-
-
-def save_cache(manifest, identity, outputs):
-    manifest.write_text(json.dumps(signature(outputs, identity), indent=2))
+    # Include tracer source as well as scientific settings in stage reuse.
+    return stage_identity("tet_trace", paths, dict(settings=settings,
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()))
 
 
 def table(path, rows, columns):

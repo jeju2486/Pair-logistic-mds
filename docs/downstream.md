@@ -53,27 +53,63 @@ time, current pair and fitting-status counts. A heartbeat prints every
 `--progress-seconds` seconds even during a slow fit. `--progress-every` controls
 additional completion messages; `--no-progress` suppresses reporting. Remaining
 time is estimated from newly completed pairs in the current run and can change
-as pair runtimes vary. Progress is written to stdout and appears in Slurm's
-`.out` log when the job is submitted with `sbatch`.
+as pair runtimes vary. Progress is written to stdout; your scheduler or terminal can capture it.
 
-The supplied `run_kovar_plot_saureus.sh` wrapper defaults to `RESUME=1`: it
-checks stage caches, reuses matching screening/automatic annotation outputs,
-and adds `--resume` when a refit database exists. Upstream cache identities use
-source paths, sizes and nanosecond mtimes (including Bakta file inventories),
-plus full SHA-256 checks of cached output files. Do not edit source contents
-while preserving their timestamps. Refit reuse separately verifies the actual
-genotypes, covariance and fitting configuration. Use a different `PREFIX` for
-a fresh independent run; `RESUME=0` does not delete an existing refit database.
-Only fully completed screening and annotation stages are reused. An interrupted
-screening pass or pyseer annotation stage restarts that stage; per-pair recovery
-applies to coefficient fitting.
+## Portable workflow for large PAN-GWES scans
 
-Old runs that never wrote refit checkpoints cannot recover unsaved effects.
-For an existing, already completed annotation from the older wrapper, set
-`AUTO_ANNOTATE=0` explicitly to reuse that TSV on the first updated submission.
-Otherwise, its missing cache manifest triggers annotation regeneration once.
-Subsequent updated runs reuse the verified stage cache automatically. The
-current running process cannot acquire these features retroactively.
+The public repository contains no ARC account paths or scheduler wrappers.
+Use explicit paths and submit these commands with your own scheduler if needed.
+The scanner and statistical rules are unchanged.
+
+```bash
+# 1. Select in chunks, preserving the original Bonferroni denominator.
+ko-variation-select --results results/ko_variation.tsv \
+  --out downstream/selected.tsv --distance-column min_distance \
+  --ld-distance 10000 --pangwes-distances --resume
+
+# 2. Annotate the selected original DNA unitigs; never map the binary A/C FASTA.
+ko-variation-map-loci --selected downstream/selected.tsv \
+  --fasta binary.fa --unitigs unitigs.tsv \
+  --panaroo panaroo/gene_presence_absence.csv --bakta bakta \
+  --out downstream/annotation --nearby-bp 500 --resume
+
+# 3. Refit selected associations and export the network.
+ko-variation-annotation --results downstream/selected.tsv \
+  --fasta binary.fa --tree rooted_tree.nwk \
+  --annotation downstream/annotation/locus_to_gene.tsv \
+  --out downstream/hits --distance-column min_distance --ld-distance 10000 \
+  --network --missing-genes drop
+```
+
+Install KOVAR with `pip install -e '.[network]'`. The mapping command additionally
+requires Pyseer, BWA, bedtools and BEDOPS (`gff2bed`). Install Pyseer in the calling
+Python environment, or provide `--pyseer-python /path/to/python`; external
+executables must be on PATH. These native tools require a compatible Unix
+environment (Linux/macOS or WSL), but no particular server or scheduler.
+Bakta inputs use `bakta/SAMPLE/SAMPLE.gff3` and `SAMPLE.fna`, with scanner FASTA
+sample names. The unitig table contains explicit zero-based IDs and DNA sequences.
+Pyseer reference paths must not contain whitespace.
+
+`--pangwes-distances` explicitly treats PAN-GWES -1 values as missing, retaining
+original values in a separate audit column. Other negative distances remain
+errors. The selected TSV retains `n_tests`; its adjacent `.selection.json`
+records original counts, settings and source path. Refit provenance carries
+this manifest forward. Keep both files together and do not edit the selected TSV.
+If distances are not PAN-GWES values, omit that flag and name the appropriate
+physical-distance column.
+
+Selection and annotation `--resume` reuse identical completed stages; interrupted
+stages restart. Add `--resume` to the final command to reuse completed per-pair
+refits. Display-only changes use `ko-variation-network` below, without refitting.
+An older completed `locus_to_gene.tsv` can still be supplied directly to the
+refit command, without repeating annotation.
+
+Stage caches use source paths, sizes and nanosecond mtimes plus output SHA-256
+hashes. Do not change inputs while preserving timestamps. The mapping command
+keeps its audit tables and `pyseer.log`, cleans temporary reference copies, and
+never changes Bakta or scanner inputs. Numerical refit checkpoint identity and
+recovery remain unchanged. The removed ARC wrappers' old annotation manifests
+are not reused by the portable mapping command.
 
 ## Selection parameters
 
@@ -147,13 +183,12 @@ An empty selection skips covariance construction and alternative fitting.
 
 ### Coding and bounded nearby annotations
 
-The plotting wrapper annotates selected unitigs uniformly across genes. It uses
-pyseer's full-length exact draft-assembly matches and Bakta CDS coordinates mapped
-to Panaroo clusters. `ANNOTATION_NEARBY_BP=500` is the default; set it to `0` for
-coding overlaps only. The annotation window is independent of `LD_DISTANCE_BP=10000`:
-the latter still selects original locus pairs with PAN-GWES minimum separation
-strictly greater than 10 kb. Neither gene coordinates nor annotation distances
-replace that distance or change the original statistical threshold.
+`ko-variation-map-loci` annotates selected unitigs uniformly across genes using
+Pyseer's full-length exact draft-assembly matches and Bakta CDS coordinates
+mapped to Panaroo clusters. `--nearby-bp 500` is the default; use `0` for coding
+overlaps only. This annotation window is independent of the 10 kb exclusion
+in the example above. Annotation never replaces the original pair distance
+or statistical threshold.
 
 A hit overlapping a CDS receives `coding` and distance zero. For an intergenic
 hit, all CDS features on the same contig within the specified window are considered.
@@ -176,31 +211,13 @@ Panaroo cluster can still collapse to one node; the mapping retains hit counts a
 reference coordinates. Nearby annotation indicates proximity, not regulation,
 causation or a demonstrated variant within that gene.
 
-```bash
-cd /data/biol-micro-genomics/kell7366/kovar/Pair-logistic-mds
-git pull --ff-only origin feature/downstream-helpers
-ANNOTATION_NEARBY_BP=500 LD_DISTANCE_BP=10000 AUTO_ANNOTATE=1 RESUME=1 \
-  sbatch --export=ALL run_kovar_plot_saureus.sh
-```
+The mapping output directory contains `locus_to_gene.tsv`, `gene_catalog.tsv`,
+`annotation_status.tsv`, `annotation_summary.json`, `annotation.cache.json` and
+`pyseer.log` when mapping was needed. The catalogue preserves distinct cluster
+IDs and biological labels, including multiple clusters with the same label.
+The audit retains all ambiguous candidates, while the mapping contains only
+resolved assignments.
 
-Use `AUTO_ANNOTATE=1` to regenerate an older supplied annotation. The new workflow
-identity invalidates the coding-only annotation cache once. Matching screening
-and refit checkpoints remain reusable; annotation labels do not change locus-pair
-fits. `REDRAW_ONLY=1` uses the annotation already in the effect table and therefore
-does **not** apply a new annotation window. An annotation-only rerun on a prepared
-directory is available as:
-
-```bash
-python -m ko_variation.locus_annotation --work covariation_map/annotation/run.XXXXXXXX \
-  --out locus_to_gene.tsv --nearby-bp 500
-```
-
-This requires the new `gene_geometry.sqlite`, metadata and pyseer hit files;
-older prepared directories must be regenerated once. No new dependencies are
-required beyond the wrapper's existing pyseer/BWA/bedtools/BEDOPS environment.
-Inspect `covariation_map/annotation/gene_catalog.tsv` for the full Panaroo gene
-list, `annotation_status.tsv` for every selected locus, and `annotation_summary.json`
-for counts and the annotation rule. Each work directory also retains these files.
 Resolved mappings carry annotation classes, distance ranges, hit counts and JSON
 evidence through the selected-pair TSV. Network nodes and edges summarize coding
 versus nearby support in their TSVs and HTML hover panels; nearby-only named nodes
@@ -216,7 +233,7 @@ across distinct copies collapse those copies into one node.
 Missing mappings are errors unless `--missing-genes drop` is set. Same-gene
 pairs are excluded unless `--include-self` is set. All unique supporting locus
 pairs remain recorded on each gene edge. Node radius represents degree within a
-small capped range (3–5 diagram units by default); ordinary nodes are charcoal.
+small capped range (3â€“5 diagram units by default); ordinary nodes are charcoal.
 Annotation groups do not control node colours or produce group legends.
 
 The representative effect is the most significant **successful adjusted fit**,
@@ -272,7 +289,7 @@ Display options: `--node-radius MIN MAX`, `--link-distances STRONG MEDIUM WEAK`,
 ### Redraw completed results without annotation or refitting
 
 ```bash
-python -m ko_variation.network_cli --effects PREFIX.distal.tsv --out PREFIX
+ko-variation-network --effects PREFIX.distal.tsv --out PREFIX
 ```
 
 This command rebuilds the gene summary and display from the completed annotated
@@ -281,17 +298,10 @@ fitting. It writes the network exports and `.network.json` with display settings
 and the source effect-table path. Preserve `.selection.json` for the original
 selection provenance. To change biological selection, rerun the analysis workflow.
 
-The S. aureus wrapper exposes the same options as environment variables:
-
-```bash
-REDRAW_ONLY=1 sbatch run_kovar_plot_saureus.sh
-NODE_RADIUS="3 4" LINK_DISTANCES="15 25 40" REDRAW_ONLY=1 sbatch run_kovar_plot_saureus.sh
-```
-
-`EFFECTS` defaults to `$PREFIX.distal.tsv`. `NETWORK_LABELS` defaults to `none`,
-`COMPONENT_GAP` to 16, and `STRENGTH_CUTOFFS` is optional. Default normal execution
-retains the existing resume/progress behaviour. Display changes do not invalidate
-refit checkpoints.
+Use the same display arguments directly on `ko-variation-network`, for example
+`--node-radius 3 4 --link-distances 15 25 40`. Display changes do not invalidate
+refit checkpoints. The former `REDRAW_ONLY` wrapper route is replaced by this
+single redraw command.
 
 ```python
 from ko_variation.postprocess import SelectionConfig, select_distal_signals, fit_selected_effects

@@ -1,7 +1,10 @@
-"""Small stage-cache utility for the S. aureus plotting wrapper."""
+"""Shared completed-stage cache for portable downstream helpers.
+
+Source identities use path, size and mtime to avoid hashing huge scan inputs.
+Completed outputs are hashed; failed stages never receive a cache manifest.
+"""
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 
@@ -39,25 +42,7 @@ def cache_fields(identity, outputs):
     return dict(cache_identity=identity, cache_outputs=[fingerprint_file(path) for path in outputs])
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("check", "store"))
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--stage", required=True)
-    parser.add_argument("--inputs", nargs="+", required=True)
-    parser.add_argument("--outputs", nargs="+", required=True)
-    parser.add_argument("--directories", nargs="*", default=[])
-    parser.add_argument("--settings", nargs="*", default=[])
-    args = parser.parse_args(argv)
-    identity = stage_identity(args.stage, args.inputs, args.settings, args.directories)
-    if args.action == "check":
-        matches = cache_matches(args.manifest, identity, args.outputs)
-        if matches:
-            print(f"[pipeline] reusing completed {args.stage} stage", flush=True)
-        return 0 if matches else 1
-    _atomic_write_bytes(Path(args.manifest), json.dumps(cache_fields(identity, args.outputs), indent=2).encode("utf-8"))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def save_cache(manifest, identity, outputs, **details):
+    """Publish provenance only after every completed output can be fingerprinted."""
+    payload = dict(details, **cache_fields(identity, outputs))
+    _atomic_write_bytes(Path(manifest), json.dumps(payload, indent=2).encode("utf-8"))

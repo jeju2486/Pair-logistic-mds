@@ -27,7 +27,8 @@ def network_options(args):
                 strength_cutoffs=args.strength_cutoffs, component_gap=args.component_gap, labels=args.labels)
 
 
-def short_label(label, gene):
+def short_label(label):
+    """Prefer a biological annotation alias over a generic cluster identifier."""
     values = [value.strip() for value in str(label).split(";") if value.strip()]
     named = [value for value in values if not re.fullmatch(r"group_\d+", value, flags=re.I)]
     return named[0] if named else ""
@@ -171,7 +172,7 @@ def export_gene_network(nodes, edges, prefix, *, seed=42, dpi=300, title="Distal
         ("x", [positions[gene][0] for gene in nodes.gene]), ("y", [positions[gene][1] for gene in nodes.gene]),
         ("radius", [radii[gene] for gene in nodes.gene]), ("component", [components[gene] for gene in nodes.gene]),
         ("component_x", [centers[gene][0] for gene in nodes.gene]), ("component_y", [centers[gene][1] for gene in nodes.gene]),
-        ("display_label", [short_label(row.label, row.gene) for row in nodes.itertuples()])):
+        ("display_label", [short_label(row.label) for row in nodes.itertuples()])):
         node_display[name] = values
     node_display["color"] = NODE_COLOR
     if "n_coding_loci" in nodes and "n_nearby_loci" in nodes:

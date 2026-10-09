@@ -3,49 +3,38 @@
 This diagnostic searches the original DNA unitigs around raw Bakta tet CDS
 annotations, then joins the results to the **full original** KOVAR pair table.
 It does not refit models, modify source files, relax filters, or insert tet nodes
-into the scientific network. The main scanner and plotting wrapper are unchanged.
+into the scientific network. The main scanner is unchanged.
 
-## Run on ARC
-
-```bash
-cd /data/biol-micro-genomics/kell7366/kovar/Pair-logistic-mds
-git pull --ff-only origin feature/downstream-helpers
-sbatch run_trace_tet_saureus.sh
-```
-
-The wrapper uses the same S. aureus paths as the plotting workflow and the existing
-KOVAR Python and pyseer annotation/BWA environments. `PAIRS` must name the exact
-zero-based candidate file supplied to the original KOVAR scan. Its default is
-`pangwes_saureus_output/saureus/saureus.mi_filtered.ud_sgg_0_based`. If your file
-has a different name, set it explicitly:
+## Portable command
 
 ```bash
-PAIRS=/absolute/path/to/the/original/zero_based_pairs \
-  sbatch --export=ALL run_trace_tet_saureus.sh
+ko-variation-trace-tet --unitigs unitigs.tsv --fasta binary.fa \
+  --bakta bakta --results results/ko_variation.tsv \
+  --panaroo panaroo/gene_presence_absence.csv --pairs candidates.tsv \
+  --annotation-status downstream/annotation/annotation_status.tsv \
+  --sample-inclusion results/sample_inclusion.tsv \
+  --run-summary results/run_summary.txt \
+  --out diagnostics/tet --genes tetK tetM \
+  --distance-column min_distance --ld-distance 10000 --resume
 ```
 
-To trace only the full KOVAR results without checking the separate candidate
-file, explicitly use `CHECK_CANDIDATES=0`. Candidate membership is then reported
-as not checked, rather than inferred from missing KOVAR rows.
+The same command runs as `python -m ko_variation.trace_tet`. Use an environment
+with KOVAR's dependencies and BWA on PATH, or pass `--bwa /path/to/bwa`. No Pyseer,
+scheduler, ARC account path or server-specific environment is required.
+Native BWA requires a compatible Unix environment such as Linux/macOS or WSL.
 
-Defaults are `GENES="tetK tetM"`, `NEARBY_BP=500`, `LD_DISTANCE_BP=10000`,
-`DISTANCE_COLUMN=min_distance`, `CROSS_CONTIG=exclude`, `BONFERRONI_ALPHA=0.05`,
-`MAX_HITS=10000` and `CHUNK_ROWS=50000`. Set selection settings to the values used
-for your map. To include further named determinants:
+`--pairs` must identify the exact zero-based candidate file supplied to the
+original scan. Omit it to report candidate membership as not checked. The Panaroo
+CSV and annotation audit are optional. Supply scanner `sample_inclusion.tsv` and
+`run_summary.txt` when available, particularly when the tree excluded isolates.
+This preserves the analyzed cohort and checks full-result counts/settings.
 
-```bash
-GENES="tetK tetM tetL tetO tetS tetW tet38" \
-  sbatch --export=ALL run_trace_tet_saureus.sh
-```
-
-The wrapper requires raw Bakta files for each scanner isolate. If you intentionally
-need a partial assembly trace, run the Python command with
-`--allow-missing-assemblies`; missing isolates are listed explicitly in the summary.
-When available, the wrapper passes the scanner's `sample_inclusion.tsv` and
-`run_summary.txt`. The former applies the same retained cohort, and the latter
-checks sample, result-row and original test counts and reports actual scan settings.
-This is important if tree matching excluded isolates. Supply these files manually
-when using the Python command outside the wrapper.
+Defaults are tetK/tetM, nearby distance 500 bp, distal cutoff 10,000 bp,
+`min_distance`, cross-contig exclusion and Bonferroni alpha 0.05. Match selection
+settings to your map. Use `--genes tetK tetM tetL tetO tetS tetW tet38` for further
+named tet determinants. This diagnostic does not yet support gyr mutation calling.
+Raw Bakta inputs use `bakta/SAMPLE/SAMPLE.gff3` and `SAMPLE.fna`. Missing assemblies
+stop preparation unless `--allow-missing-assemblies` is explicitly supplied.
 
 ## What it checks
 
@@ -89,7 +78,7 @@ An unmapped CDS remains visible in the target table rather than losing its raw n
 
 ## Reports
 
-Default output: `kovar_saureus_output/saureus/results/tet_trace/`.
+Reports are written to the directory supplied with `--out`.
 
 | File | Content |
 | --- | --- |
@@ -115,12 +104,13 @@ defined distal network. If selected distal tet-associated rows survive but the
 current audit assigns unrelated/ambiguous genes, inspect reference-dependent
 annotation and the raw CDS evidence.
 
-The wrapper enables `--resume`. Completed preparation, mapping and tracing reports
+Add `--resume` to reuse completed stages. Completed preparation, mapping and tracing reports
 are reused only when inputs/settings/source match. Interrupted stages restart;
 existing KOVAR models are never rerun. Cache identity uses source paths, sizes and
-nanosecond mtimes, plus the tracer's source hash and settings. Do not alter cached
-inputs or outputs while preserving their timestamps. BWA stages are single-process;
-the ARC wrapper requests one CPU and 24 GB RAM. Preparation and pair scans report
+nanosecond mtimes, plus the tracer's source hash and settings. Outputs use SHA-256
+hashes through the shared downstream cache. Older tracer manifests regenerate
+once; numerical refit checkpoints are unaffected. Do not alter inputs while
+preserving their timestamps. BWA stages are single-process. Preparation and pair scans report
 progress. BWA diagnostics are stored in `bwa_index.log` and `bwa_fastmap.log`.
 
 The Python entry point is `python -m ko_variation.trace_tet --help`. Dependencies
