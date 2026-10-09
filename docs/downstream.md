@@ -282,9 +282,15 @@ Strong, medium and weak target lengths default to 20, 35 and 55 **diagram units*
 respectively; they are layout preferences, not exact lengths or genomic distances.
 Graph constraints can prevent any edge from attaining its target length. Static
 labels default to none; `--labels hubs` or `all` enables named-gene labels. Generic
-`group_###` labels remain in tables and tooltips rather than cluttering the canvas.
+`group_###` identifiers remain in tables and a collapsible traceability field;
+canvas labels, tooltips and edge descriptions show biological annotation names.
+All named aliases are retained. Unknown nodes show a product description or
+`Unannotated protein`; they are never given invented gene names.
 Display options: `--node-radius MIN MAX`, `--link-distances STRONG MEDIUM WEAK`,
 `--component-gap GAP`, `--strength-cutoffs LOW HIGH`, and `--labels none|hubs|all`.
+Use `--gene-catalog annotation/gene_catalog.tsv` to refresh names by cluster ID
+and `--eggnog network.emapper.annotations` for broad COG node colours and
+searchable GO terms. See [functional map instructions](functional_map.md).
 
 ### Redraw completed results without annotation or refitting
 

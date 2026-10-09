@@ -38,7 +38,7 @@ class NetworkDisplayTests(unittest.TestCase):
             self.assertEqual(drawn[('D','group_999')]['representative_adjusted_beta'], None)
             self.assertTrue(all(3 <= row['radius'] <= 5 for row in payload['nodes']))
             generic = next(row for row in payload['nodes'] if row['gene']=='group_999')
-            self.assertEqual(generic['display_label'], '')
+            self.assertEqual(generic['display_label'], 'Unannotated protein')
             document = paths['html'].read_text()
             self.assertNotIn('<script src=', document)
             self.assertNotIn('Group: Panaroo cluster', document)
@@ -64,11 +64,20 @@ class NetworkDisplayTests(unittest.TestCase):
             effects = folder/'saved.distal.tsv'
             example_signals().to_csv(effects, sep='\t', index=False)
             before = effects.read_bytes()
-            result = redraw_main(['--effects', str(effects), '--out', str(folder/'redrawn'), '--dpi', '72'])
+            eggnog = folder/'network.emapper.annotations'
+            eggnog.write_text('#query\tCOG_category\tGOs\nA\tM\tGO:0005886\nB\tS\t-\nC\tMT\t-\nD\tV\t-\n')
+            result = redraw_main(['--effects', str(effects), '--out', str(folder/'redrawn'), '--dpi', '72', '--eggnog', str(eggnog)])
             self.assertEqual(result, 0)
             self.assertEqual(effects.read_bytes(), before)
             metadata = json.loads((folder/'redrawn.network.json').read_text())
             self.assertFalse(metadata['refitted'])
+            payload = json.loads((folder/'redrawn.layout.json').read_text())
+            displayed = {node['gene']: node for node in payload['nodes']}
+            self.assertEqual(displayed['A']['function_category'], 'Cell envelope')
+            self.assertEqual(displayed['C']['function_category'], 'Multiple categories')
+            self.assertEqual(displayed['group_999']['function_category'], 'Unassigned')
+            self.assertNotEqual(displayed['A']['color'], displayed['B']['color'])
+            self.assertIn('eggnog', payload['meta']['annotation_sources'])
 
 
 if __name__ == '__main__':

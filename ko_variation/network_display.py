@@ -4,17 +4,19 @@ from __future__ import annotations
 import html
 import json
 from pathlib import Path
-import re
+import hashlib
 
 import numpy as np
 import pandas as pd
+from .functional_annotation import annotate_nodes, FUNCTION_COLORS
 
 COLORS = dict(positive="#C62828", negative="#2166AC", mixed="#7B3294",
               neutral="#AAB2BC", unknown="#AAB2BC")
-NODE_COLOR = "#3F4A5A"
 
 
 def add_network_arguments(parser):
+    parser.add_argument("--gene-catalog", help="Refresh annotation names/products by stable cluster ID")
+    parser.add_argument("--eggnog", help="eggNOG .emapper.annotations with cluster IDs as query IDs; node fill uses broad COG categories")
     parser.add_argument("--node-radius", type=float, nargs=2, default=[3, 5], metavar=("MIN", "MAX"))
     parser.add_argument("--link-distances", type=float, nargs=3, default=[20, 35, 55], metavar=("STRONG", "MEDIUM", "WEAK"))
     parser.add_argument("--strength-cutoffs", type=float, nargs=2, metavar=("LOW", "HIGH"), help="Fixed |representative beta| boundaries; default within-map tertiles")
@@ -24,14 +26,8 @@ def add_network_arguments(parser):
 
 def network_options(args):
     return dict(node_radius=args.node_radius, link_distances=args.link_distances,
-                strength_cutoffs=args.strength_cutoffs, component_gap=args.component_gap, labels=args.labels)
-
-
-def short_label(label):
-    """Prefer a biological annotation alias over a generic cluster identifier."""
-    values = [value.strip() for value in str(label).split(";") if value.strip()]
-    named = [value for value in values if not re.fullmatch(r"group_\d+", value, flags=re.I)]
-    return named[0] if named else ""
+                strength_cutoffs=args.strength_cutoffs, component_gap=args.component_gap, labels=args.labels,
+                gene_catalog=args.gene_catalog, eggnog=args.eggnog)
 
 
 def _records(frame):
@@ -145,7 +141,7 @@ def _positions(nodes, edges, seed, radius, gap):
 
 def export_gene_network(nodes, edges, prefix, *, seed=42, dpi=300, title="Distal gene covariation",
                         node_radius=(3, 5), link_distances=(20, 35, 55), strength_cutoffs=None,
-                        component_gap=16, labels="none"):
+                        component_gap=16, labels="none", gene_catalog=None, eggnog=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -167,21 +163,24 @@ def export_gene_network(nodes, edges, prefix, *, seed=42, dpi=300, title="Distal
     radii = {row.gene: node_radius[0] + (node_radius[1]-node_radius[0]) * np.sqrt(max(row.degree-1, 0) / max(degree_max-1, 1))
              for row in nodes.itertuples()}
     positions, centers, components, width, height = _positions(nodes, edge_display, seed, radii, component_gap)
-    node_display = nodes.copy()
+    node_display = annotate_nodes(nodes, gene_catalog, eggnog)
     for name, values in (
         ("x", [positions[gene][0] for gene in nodes.gene]), ("y", [positions[gene][1] for gene in nodes.gene]),
         ("radius", [radii[gene] for gene in nodes.gene]), ("component", [components[gene] for gene in nodes.gene]),
         ("component_x", [centers[gene][0] for gene in nodes.gene]), ("component_y", [centers[gene][1] for gene in nodes.gene]),
-        ("display_label", [short_label(row.label) for row in nodes.itertuples()])):
+        ):
         node_display[name] = values
-    node_display["color"] = NODE_COLOR
-    if "n_coding_loci" in nodes and "n_nearby_loci" in nodes:
-        nearby_only = nodes.n_coding_loci.eq(0) & nodes.n_nearby_loci.gt(0) & node_display.display_label.ne("")
-        node_display.loc[nearby_only, "display_label"] = "near " + node_display.loc[nearby_only, "display_label"]
+    function_legend = {category: color for category, color in FUNCTION_COLORS.items()
+                       if eggnog and category in set(node_display.function_category)}
     fig_width = max(6, min(14, width/100))
-    fig_height = max(3.5, fig_width * height/width) + 0.7
+    legend_columns = 2 if fig_width < 9 else 3
+    legend_rows = int(np.ceil(len(function_legend) / legend_columns))
+    # Reserve physical footer space so many functional categories cannot overlap
+    # the graph, including on narrow maps with only a few connected components.
+    footer_inches = .7 + (.22 * (legend_rows + 1) if function_legend else 0)
+    fig_height = max(3.5, fig_width * height/width) + footer_inches
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    fig.subplots_adjust(left=.02, right=.98, bottom=.15, top=.94 if title else .99)
+    fig.subplots_adjust(left=.02, right=.98, bottom=footer_inches/fig_height, top=.94 if title else .99)
     unit_points = fig_width * .96 * 72 / width
     for row in edge_display.itertuples():
         a, b = positions[row.gene_a], positions[row.gene_b]
@@ -194,10 +193,10 @@ def export_gene_network(nodes, edges, prefix, *, seed=42, dpi=300, title="Distal
                     lw=row.display_width, alpha=.7, linestyle=style, zorder=1)
     if len(nodes):
         ax.scatter(node_display.x, node_display.y, s=[(2*r*unit_points)**2 for r in node_display.radius],
-                   c=NODE_COLOR, edgecolors="white", linewidths=.35, zorder=2)
+                   c=node_display.color.tolist(), edgecolors="white", linewidths=.35, zorder=2)
         hub_threshold = float(nodes.degree.quantile(.95))
         for row in node_display.itertuples():
-            if row.display_label and (labels == "all" or labels == "hubs" and row.degree >= max(3, hub_threshold)):
+            if (row.annotation_names or row.eggnog_preferred_name) and (labels == "all" or labels == "hubs" and row.degree >= max(3, hub_threshold)):
                 ax.annotate(row.display_label, (row.x, row.y), xytext=(4, 4), textcoords="offset points", fontsize=8)
     else:
         ax.text(width/2, height/2, "No gene pairs pass selection", ha="center")
@@ -209,20 +208,30 @@ def export_gene_network(nodes, edges, prefix, *, seed=42, dpi=300, title="Distal
                       linestyle="--" if direction in {"mixed", "unknown"} else "-")
                for direction, color in COLORS.items() if direction in set(edge_display.adjusted_direction)]
     if handles:
-        fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5, .07), ncol=len(handles), frameon=False, fontsize=8)
+        fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5, .32/fig_height), ncol=len(handles), frameon=False, fontsize=8)
+    if function_legend:
+        function_handles = [Line2D([], [], marker="o", color="none", markerfacecolor=color,
+                                  markeredgecolor="white", label=category, markersize=6)
+                            for category, color in function_legend.items()]
+        fig.legend(handles=function_handles, loc="lower center", bbox_to_anchor=(.5, .65/fig_height),
+                   ncol=legend_columns, frameon=False, fontsize=8, title="Node fill: broad COG function")
     threshold_text = "No finite representative coefficients" if boundaries is None else (
         f"|representative β|: weak ≤ {boundaries[0]:.3g}; medium > {boundaries[0]:.3g} to {boundaries[1]:.3g}; strong > {boundaries[1]:.3g}")
-    fig.text(.5, .025, threshold_text + "\nSpacing/width: representative |β|; node size: degree; positions are diagram coordinates.",
+    fig.text(.5, .08/fig_height, threshold_text + "\nSpacing/width: representative |β|; node size: degree; positions are diagram coordinates.",
              ha="center", fontsize=7)
     with matplotlib.rc_context({"svg.fonttype": "none"}):
         fig.savefig(paths["png"], dpi=dpi, facecolor="white")
         fig.savefig(paths["svg"], facecolor="white")
     plt.close(fig)
+    sources = {key: dict(path=str(Path(path).resolve()), sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest())
+               for key, path in (("gene_catalog", gene_catalog), ("eggnog", eggnog)) if path}
     payload = dict(nodes=_records(node_display), edges=_records(edge_display),
                    meta=dict(width=width, height=height, seed=seed, node_radius=list(node_radius),
                              link_distances=list(link_distances), strength_cutoffs=boundaries,
                              cutoff_mode="fixed" if strength_cutoffs is not None else "within_map_tertiles",
                              component_gap=component_gap, labels=labels, title=title, colors=COLORS,
+                             function_colors=function_legend, annotation_sources=sources,
+                             function_mapping="broad COG display bins; multiple bins retained; R/S or missing are unassigned",
                              representative_rule="smallest-P successful locus refit; ties u,v",
                              layout_method="packed connected components; beta-weighted shortest-path springs",
                              layout_distance_units="diagram units, not genomic bp"))

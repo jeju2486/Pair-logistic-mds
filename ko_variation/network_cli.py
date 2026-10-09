@@ -21,8 +21,9 @@ def main(argv=None):
     add_network_arguments(parser)
     args = parser.parse_args(argv)
     outputs = [Path(args.out + suffix) for suffix in (".png", ".svg", ".html", ".nodes.tsv", ".edges.tsv", ".layout.json", ".network.json")]
-    if any(path.resolve() == Path(args.effects).resolve() for path in outputs):
-        parser.error("Network outputs must not overwrite the effect table")
+    sources = [Path(path).resolve() for path in (args.effects, args.gene_catalog, args.eggnog) if path]
+    if any(path.resolve() in sources for path in outputs):
+        parser.error("Network outputs must not overwrite the effect table or annotation inputs")
     try:
         print(f"[network] reading saved effects: {args.effects}; no refitting", flush=True)
         signals = pd.read_csv(args.effects, sep="\t", dtype={"u_gene": str, "v_gene": str})

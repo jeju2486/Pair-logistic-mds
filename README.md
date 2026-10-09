@@ -150,6 +150,8 @@ Portable commands replace the former ARC submission wrappers:
 - `ko-variation-select`: select a large full scan in chunks without changing n_tests.
 - `ko-variation-map-loci`: map selected DNA unitigs to Bakta/Panaroo annotations.
 - `ko-variation-network`: redraw completed effects without refitting.
+- `ko-variation-prepare-proteins`: prepare mapped representative proteins for
+  eggNOG functional annotation and optional COG node colours.
 - `ko-variation-amr-report`: link species-specific MIC availability, established
   presence/absence determinant labels, and representation in a selected distal map.
 
@@ -163,6 +165,8 @@ register the new helper commands. Existing scanner commands are unchanged.
 
 Full options, failed-fit handling, coordinate fallback, and aggregation rules are
 documented in [docs/downstream.md](docs/downstream.md).
+See [annotation names and functional colours](docs/functional_map.md) for
+alias-aware search, gene-name labels, and eggNOG/GO metadata on existing maps.
 
 ## Checkpoint and resume
 
