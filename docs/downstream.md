@@ -325,3 +325,7 @@ the selected network. It requires no refitting and leaves the map unchanged.
 Run `python examples/downstream/reproduce.py` for a synthetic star-tree example
 with scanner output, alternative fits, and network exports. Minimal focused
 checks: `python -m unittest discover -s tests -p test_postprocess.py`.
+
+For binary matrix export, tree-aligned presence/absence plots and grouped held-out
+MIC ridge modelling, see the optional [phenotype helper](phenotype.md). It reads
+the completed selected map and leaves the main KOVAR runner unchanged.
