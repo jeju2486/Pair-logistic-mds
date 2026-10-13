@@ -327,5 +327,5 @@ with scanner output, alternative fits, and network exports. Minimal focused
 checks: `python -m unittest discover -s tests -p test_postprocess.py`.
 
 For binary matrix export, tree-aligned presence/absence plots and grouped held-out
-MIC ridge modelling, see the optional [phenotype helper](phenotype.md). It reads
+phylogenetic MIC interaction modelling, see the optional [phenotype helper](phenotype.md). It reads
 the completed selected map and leaves the main KOVAR runner unchanged.
