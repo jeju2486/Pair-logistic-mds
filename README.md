@@ -154,12 +154,16 @@ Portable commands replace the former ARC submission wrappers:
   eggNOG functional annotation and optional COG node colours.
 - `ko-variation-amr-report`: link species-specific MIC availability, established
   presence/absence determinant labels, and representation in a selected distal map.
+- `ko-variation-unitig-audit`: annotate the entire supplied DNA unitig catalogue
+  and report AMR-associated patterns' MAF, entropy and phylogenetic D, before filtering.
 
 The documented [portable pipeline](docs/downstream.md#portable-workflow-for-large-pan-gwes-scans)
 uses explicit paths and retains selection, annotation and refit recovery.
 See [AMR reporting](docs/amr_report.md) for the curated catalogue, annotation-name
 matching, and direct/second-order neighbour report. The tet-specific tracer has
 been removed; its old commands are no longer supported.
+See the separate [whole-catalogue unitig and D audit](docs/unitig_audit.md) for
+installation (`.[audit]` plus R ape/caper), checkpointing and input contracts.
 After updating an existing checkout, rerun `pip install -e '.[network]'` to
 register the new helper commands. Existing scanner commands are unchanged.
 
