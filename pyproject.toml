@@ -34,6 +34,7 @@ ko-variation-network = "ko_variation.network_cli:main"
 ko-variation-prepare-proteins = "ko_variation.functional_annotation:main"
 ko-variation-amr-report = "ko_variation.amr_report:main"
 ko-variation-phenotype = "ko_variation.phenotype:main"
+ko-variation-fastbaps = "ko_variation.fastbaps:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

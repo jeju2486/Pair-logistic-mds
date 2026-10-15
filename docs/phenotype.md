@@ -5,13 +5,16 @@ change the main KOVAR runner, network selection or effect-estimation workflow.
 
 ```bash
 python -m pip install -e '.[phenotype]'
+python -m ko_variation.fastbaps \
+  --alignment core_gene_alignment.aln --fasta sample_ids.fasta \
+  --metadata collection.tsv --out population_groups --resume
 python -m ko_variation.phenotype \
   --fasta sample_ids.fasta --fasta-columns-are-locus-ids \
   --tree core.treefile --metadata collection.tsv \
   --species 'Staphylococcus aureus' \
   --network gene_covariation_functional.html \
   --annotation annotation/locus_to_gene.tsv --target mprF \
-  --out mprF_mic_interaction
+  --clusters population_groups/clusters.tsv --out mprF_mic_fastbaps
 ```
 
 ## Input and cohort contracts
@@ -68,10 +71,46 @@ KOVAR genomic association model.
 - Random1, Random2 and RandomPair: matched added main effects and, where estimable,
   independent product terms.
 
-Up to ten complete-linkage patristic groups (`--groups`) define up to five
-GroupKFold partitions (`--folds`), without MIC. At least three phenotype-bearing
-groups are required. All models share test isolates. Grouping is reproducible,
-not a guarantee that all related lineages are separated.
+Default grouping uses an external fastBAPS partition (`--clusters`, TSV columns
+`sample,cluster`) inferred from genuine aligned core-genome DNA after cohort
+exclusion. MIC values and target unitigs do not choose the partition. The final
+cluster count is inferred, not fixed at ten. Labels join by sample ID; missing,
+duplicate or unexpected extra samples are errors. Up to five GroupKFold
+partitions (`--folds`) keep each cluster together. At least three clusters must
+contain exact MICs. All models share test isolates. Cluster count depends on
+alignment, prior and algorithm settings; it is not an established biological truth
+or a guarantee that all related lineages are separated. Cluster grouping does
+not replace the continuous tree covariance K in the MIC models.
+
+The separate `ko-variation-fastbaps` / `python -m ko_variation.fastbaps` stage
+uses the official R fastbaps package, not an unrelated Python implementation:
+
+```bash
+conda create -n fastbaps -c conda-forge -c bioconda r-fastbaps r-ape
+python -m ko_variation.fastbaps --alignment core_gene_alignment.aln \
+  --fasta sample_ids.fasta --metadata collection.tsv --out population_groups \
+  --rscript /path/to/fastbaps/environment/bin/Rscript --resume
+```
+
+The default prior is `optimise.symmetric`, with one inferred partition and the
+package's default initial clustering size. Initialization is not the requested
+final K. The wrapper removes non-cohort sequences **before** SNP import and prior
+optimization. Never use the artificial A/C unitig FASTA as `--alignment`.
+Outputs include `clusters.tsv`, `cluster_sizes.tsv`, `hierarchy.rds`, the cleaned
+`cohort_alignment.fasta`, excluded/omitted sample audits, `fastbaps_run.tsv`,
+`sessionInfo.txt` and `fastbaps.json` with versions/settings and cache identity.
+Source cache identities use path, size and nanosecond modification time;
+completed result fingerprints are verified before reuse. No MIC-based selection
+of prior, resolution or seed is performed. Fewer than three phenotype-bearing
+clusters stops cross-validation rather than forcing a finer partition.
+
+For explicit reproduction of the old grouping only, use
+`--group-method complete --groups 10` without `--clusters`. New fastBAPS groups
+change held-out partitions; old MIC fits are invalidated but compatible raw
+matrix caches remain reusable. The group colour track remains omitted.
+
+Method: [Tonkin-Hill et al., 2019](https://doi.org/10.1093/nar/gkz361).
+Implementation: [official fastbaps](https://github.com/gtonkinhill/fastbaps).
 
 Training-only filtering requires five present and five absent observations
 (`--min-count`). Baseline-first rank filtering removes linear dependencies;

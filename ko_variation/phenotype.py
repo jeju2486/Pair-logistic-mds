@@ -20,7 +20,7 @@ from . import __version__
 from .amr_report import gene_key, label_tokens, mic_record, present, read_tsv, write_tsv
 
 # Increment when numerical fitting/feature selection changes, to invalidate old folds.
-ALGORITHM = "mic-phylogenetic-interaction-2"
+ALGORITHM = "mic-phylogenetic-interaction-3"
 
 
 def log(message):
@@ -287,8 +287,6 @@ def phenotype_rows(args, samples, out):
 
 def tree_and_groups(args, samples, out, exclusions=()):
     from Bio import Phylo
-    from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import squareform
 
     tree = Phylo.read(args.tree, "newick")
     tips = tree.get_terminals()
@@ -330,14 +328,32 @@ def tree_and_groups(args, samples, out, exclusions=()):
         raise ValueError("Tree has no positive shared-branch covariance scale")
     K /= scale
     npz_write(out / "phylogenetic_covariance.npz", samples=np.asarray(samples), K=K)
-    # Complete-linkage groups depend only on patristic distances, never MIC.
-    groups = fcluster(linkage(squareform(D), method="complete"),
-                      t=min(args.groups, len(samples)), criterion="maxclust")
+    groups = analysis_groups(args, samples, D, exclusions)
     write_tsv(out / "tree_order.tsv", ({"sample": tip.name, "tree_row": i,
-              "phylogenetic_group": int(groups[samples.index(tip.name)])} for i, tip in enumerate(tips)),
-              ["sample", "tree_row", "phylogenetic_group"])
-    log(f"midpoint-rooted tree: {len(tips)} tips; {len(set(groups))} phylogenetic groups")
+              "phylogenetic_group": str(groups[samples.index(tip.name)]),
+              "grouping_method": args.group_method} for i, tip in enumerate(tips)),
+              ["sample", "tree_row", "phylogenetic_group", "grouping_method"])
+    log(f"midpoint-rooted tree: {len(tips)} tips; {len(set(groups))} {args.group_method} groups")
     return tree, groups, K
+
+
+def analysis_groups(args, samples, distances, exclusions=()):
+    """Join external fastBAPS labels strictly by isolate ID, independently of MIC."""
+    if args.group_method == "fastbaps":
+        records = read_tsv(args.clusters, ["sample", "cluster"])
+        lookup = {row["sample"]: row["cluster"].strip() for row in records}
+        if len(lookup) != len(records) or any(not key or not value for key, value in lookup.items()):
+            raise ValueError("Cluster table requires unique sample IDs and nonempty labels")
+        missing = set(samples)-set(lookup)
+        extra = set(lookup)-set(samples)-set(exclusions)
+        if missing or extra:
+            raise ValueError(f"Cluster/cohort mismatch: missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}")
+        return np.asarray([lookup[sample] for sample in samples])
+    # Explicit legacy option for reproducing the previous patristic partition.
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import squareform
+    return fcluster(linkage(squareform(distances), method="complete"),
+                    t=min(args.groups, len(samples)), criterion="maxclust")
 
 
 def save_figure(fig, prefix, dpi):
@@ -426,7 +442,9 @@ def main(argv=None):
     parser.add_argument("--exclude-sample", action="append", default=[], help="Additional exact FASTA sample ID to exclude")
     parser.add_argument("--matrix-cache", type=Path, help="Directory containing a reusable raw matrix.npz and matrix.json")
     parser.add_argument("--random-pool", type=Path, help="Optional independently defined eligible locus pool")
-    parser.add_argument("--groups", type=int, default=10, help="Maximum complete-linkage patristic groups")
+    parser.add_argument("--group-method", choices=["fastbaps", "complete"], default="fastbaps")
+    parser.add_argument("--clusters", type=Path, help="fastBAPS TSV with sample,cluster; required for default grouping")
+    parser.add_argument("--groups", type=int, default=10, help="Maximum groups for explicit legacy --group-method complete only")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--random-sets", type=int, default=100)
     parser.add_argument("--min-count", type=int, default=5, help="Minimum present AND absent training isolates")
@@ -437,12 +455,16 @@ def main(argv=None):
     parser.add_argument("--no-full-tsv", action="store_true", help="Cache full matrix; export only neighbourhood TSV")
     parser.add_argument("--stage", choices=["all", "tree"], default="all", help="tree skips MIC model fitting")
     args = parser.parse_args(argv)
-    if args.groups < 3 or args.folds < 3 or args.random_sets < 1 or args.min_count < 1 or args.dpi < 72:
-        parser.error("groups/folds >=3, random-sets/min-count >=1, dpi >=72 required")
+    if args.folds < 3 or args.random_sets < 1 or args.min_count < 1 or args.dpi < 72:
+        parser.error("folds >=3, random-sets/min-count >=1, dpi >=72 required")
+    if args.group_method == "fastbaps" and args.clusters is None:
+        parser.error("fastBAPS grouping requires --clusters FILE; infer it first with ko-variation-fastbaps")
+    if args.group_method == "complete" and (args.groups < 3 or args.clusters is not None):
+        parser.error("Legacy complete grouping requires groups >=3 and does not accept --clusters")
     if args.seed < 0 or args.interaction_bootstrap < 0 or args.interaction_min_cell < 1:
         parser.error("seed/bootstrap must be nonnegative; interaction-min-cell must be positive")
     sources = {}
-    for name in ("fasta", "tree", "metadata", "network", "annotation", "locus_map", "sample_map", "random_pool"):
+    for name in ("fasta", "tree", "metadata", "network", "annotation", "locus_map", "sample_map", "random_pool", "clusters"):
         path = getattr(args, name)
         if path:
             if not path.is_file():
@@ -464,6 +486,7 @@ def main(argv=None):
                    network_discovery="not repeated inside folds; not independent end-to-end discovery validation",
                    gene_variation="exact unitig-sequence presence; named substitutions not inferred",
                    model="Gaussian phylogenetic mixed model fitted by maximum likelihood; selected direct pair products",
+                   grouping=args.group_method,
                    covariance="shared root-to-MRCA branch length normalized by mean diagonal",
                    cohort="non-target metadata species excluded before midpoint rooting, grouping and fitting",
                    frozen_network="exclusion does not rescan or reselect the previously constructed network",
@@ -480,7 +503,7 @@ def main(argv=None):
     if args.stage == "all":
         from .phenotype_lmm import fit_prediction
         fit_prediction(args, samples, X, loci, features, pool, pairs, phenotype, groups, K, args.out, identity)
-    summary.update(status="complete", n_samples=len(samples), excluded_samples=sorted(exclusions), n_unitigs=len(loci), n_features=len(features),
+    summary.update(status="complete", n_samples=len(samples), n_groups=len(set(groups)), excluded_samples=sorted(exclusions), n_unitigs=len(loci), n_features=len(features),
                    phenotype_counts={s: sum(p["status"] == s for p in phenotype)
                                      for s in sorted({p["status"] for p in phenotype})})
     json_write(args.out / "run.json", summary)
@@ -502,7 +525,7 @@ def main(argv=None):
         "by maximum likelihood. Missing, sparse and linearly dependent states are reported without forced interaction "
         "estimates. Reported coefficient intervals use nominal GLS standard errors; bootstrap P values simulate "
         "the fitted null model.\n\n"
-        "Observed versus predicted. Predictions are held out by phylogenetic group. Horizontal jitter "
+        f"Observed versus predicted. Predictions are held out by {args.group_method} group. Horizontal jitter "
         "is display-only. The diagonal marks equality. MICs and predictions are expressed in log2 units. "
         "The existing network was discovered from the cohort and frozen before modelling; this is "
         "not an independent end-to-end evaluation of network discovery. Improved prediction does not "

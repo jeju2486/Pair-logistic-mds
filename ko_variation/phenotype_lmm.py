@@ -182,7 +182,7 @@ def fit_prediction(args, samples, X, loci, features, pool, pairs, phenotype, gro
                      for i in range(3)}
     nfolds = min(args.folds, len(set(group)))
     if nfolds < 3:
-        raise ValueError("At least three phenotype-bearing phylogenetic groups required")
+        raise ValueError("At least three phenotype-bearing groups required; do not change fastBAPS settings using MIC performance")
     splits = list(GroupKFold(n_splits=nfolds).split(data, y, group))
     labels = ["Mean_only", "Phylogeny_only", "M0", "M1", "M2", "M1_pair"] + [
         f"Random{size}_{r:03d}" for size in (1, 2) for r in range(1, args.random_sets+1)] + [
