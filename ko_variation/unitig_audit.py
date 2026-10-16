@@ -433,7 +433,7 @@ def reports(args, records, genes_for_target, rules, patterns, d_results):
         accepted = [r for r in records if r["target"] == target and r["match_status"] == "annotation_match"]
         coding = [r for r in accepted if r["annotation_class"] == "coding"]
         values = [float(r["D"]) for r in coding if r["D_status"] == "ok"]
-        summaries.append(dict(target=target, n_annotated_CDS= len(genes_for_target[target]),
+        summaries.append(dict(target=target, n_annotated_CDS=genes_for_target[target] if isinstance(genes_for_target[target], int) else len(genes_for_target[target]),
             n_coding_unitigs=len({r["locus"] for r in coding}), n_nearby_unitigs=len({r["locus"] for r in accepted if r["annotation_class"] != "coding"}),
             n_coding_patterns=len({r["pattern_id"] for r in coding if r["pattern_id"]}),
             n_coding_binary_unavailable=len({r["locus"] for r in coding if not r["pattern_id"]}),
@@ -454,11 +454,129 @@ def reports(args, records, genes_for_target, rules, patterns, d_results):
         ["pattern_id"]+stat_keys+["n_unitigs"]+d_keys)
 
 
+def probe_r(args):
+    """Check only the runtime needed for D, before expensive upstream work."""
+    probe = subprocess.run([args.rscript, "--vanilla", "-e",
+        'stopifnot(requireNamespace("ape",quietly=TRUE),requireNamespace("caper",quietly=TRUE)); '
+        'cat(R.version.string,as.character(packageVersion("ape")),as.character(packageVersion("caper")),sep="\\n")'],
+        check=False, capture_output=True, text=True)
+    if probe.returncode:
+        raise ValueError(f"R dependency check failed: {probe.stderr.strip()}. Install ape/caper in this R environment, or use --stage annotate")
+    args.r_versions = probe.stdout.strip()
+
+
+def save_annotation_state(args, records, genes_for_target, rules, patterns, provenance, counts):
+    """Freeze small prepared inputs independently of mutable final D reports."""
+    wanted = {r["pattern_id"] for r in records if r["pattern_id"]}
+    state = dict(schema=1, records=records,
+        genes_for_target={k: v if isinstance(v, int) else len(v) for k, v in genes_for_target.items()},
+        rules=rules, patterns={pid: {k: v for k, v in patterns[pid].items() if k != "bits"} for pid in sorted(wanted)},
+        provenance=provenance, counts=counts)
+    json_write(args.out/"annotation_state.json", state)
+    outputs = [args.out/name for name in ("annotation_state.json", "analysis.treefile", "target_patterns.tsv")]
+    save_cache(args.out/"annotation_ready.json", dict(stage="annotation_ready_1"), outputs)
+    return state
+
+
+def legacy_annotation_state(args):
+    """Import old completed tables once, without reading assembly evidence or gzip.
+
+    Older failed-D runs did not save source provenance. This explicit D-only
+    restart adopts the existing prepared tree/patterns, not today's raw inputs.
+    """
+    required = ["amr_unitig_audit.tsv", "amr_gene_summary.tsv", "pattern_statistics.tsv",
+                "analysis.treefile", "target_patterns.tsv"]
+    for name in required:
+        if not (args.out/name).is_file():
+            raise ValueError(f"D-only restart missing {name}. Finish --stage annotate first")
+    records = read_tsv(args.out/"amr_unitig_audit.tsv", ["target", "locus", "pattern_id", "match_status"])
+    for row in records:
+        for key in ("locus", "distance_min_bp", "evidence_rows", "n_references"):
+            row[key] = int(row[key])
+    summary = read_tsv(args.out/"amr_gene_summary.tsv", ["target", "n_annotated_CDS"])
+    rules = {r["target"]: dict(determinant=r["target"]) for r in summary}
+    if len(rules) != len(summary) or not {r["target"] for r in records}.issubset(rules):
+        raise ValueError("Saved target summary and unitig report do not agree")
+    wanted = {r["pattern_id"] for r in records if r["pattern_id"]}
+    patterns, n_patterns, n_binary = {}, 0, 0
+    with (args.out/"pattern_statistics.tsv").open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            n_patterns += 1
+            n_binary += int(row["n_unitigs"])
+            if row["pattern_id"] in wanted:
+                if row["pattern_id"] in patterns:
+                    raise ValueError("Duplicate pattern statistics")
+                for key in ("n_present", "n_absent", "n_unitigs", "passes_maf"):
+                    row[key] = int(row[key])
+                for key in ("maf", "entropy_bits"):
+                    row[key] = float(row[key])
+                patterns[row["pattern_id"]] = row
+    if set(patterns) != wanted:
+        raise ValueError("Saved pattern statistics do not cover all reported unitigs")
+    log("importing legacy prepared tables; original source provenance was not saved by that run")
+    log("D-only mode uses the saved tree and patterns; raw input options are not reapplied")
+    return save_annotation_state(args, records, {r["target"]: int(r["n_annotated_CDS"]) for r in summary},
+        rules, patterns, dict(origin="legacy_prepared_tables", raw_source_identity_verified=False),
+        dict(n_patterns=n_patterns, n_binary_loci=n_binary))
+
+
+def restart_d(args):
+    """Skip FASTA loading, reference annotation, collection and all gzip exports."""
+    from Bio import Phylo
+    ready = args.out/"annotation_ready.json"
+    if ready.exists():
+        outputs = [args.out/name for name in ("annotation_state.json", "analysis.treefile", "target_patterns.tsv")]
+        if not cache_matches(ready, dict(stage="annotation_ready_1"), outputs):
+            raise ValueError("Prepared annotation/tree/pattern checkpoint changed or is incomplete; restore its matching files or rerun annotation")
+        state = json.loads((args.out/"annotation_state.json").read_text(encoding="utf-8"))
+    else:
+        state = legacy_annotation_state(args)
+    if state.get("schema") != 1:
+        raise ValueError("Unsupported prepared annotation schema")
+    records, patterns = state["records"], state["patterns"]
+    selected = []
+    with (args.out/"target_patterns.tsv").open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        header = reader.fieldnames or []
+        if not header or header[0] != "pattern_id" or len(set(header)) != len(header):
+            raise ValueError("Invalid prepared pattern-matrix header")
+        samples = header[1:]
+        tips = [t.name for t in Phylo.read(args.out/"analysis.treefile", "newick").get_terminals()]
+        if len(tips) != len(samples) or set(tips) != set(samples):
+            raise ValueError("Saved pattern-matrix samples and tree tips differ")
+        for row in reader:
+            pid = row["pattern_id"]
+            if pid not in patterns or any(row.get(s) not in ("0", "1") for s in samples):
+                raise ValueError(f"Invalid prepared binary pattern {pid}")
+            n_present = sum(row[s] == "1" for s in samples)
+            if n_present != patterns[pid]["n_present"] or len(samples)-n_present != patterns[pid]["n_absent"]:
+                raise ValueError(f"Prepared pattern counts disagree for {pid}")
+            selected.append(pid)
+    expected = {r["pattern_id"] for r in records if r["pattern_id"] and r["match_status"] != "rejected_product"}
+    if len(set(selected)) != len(selected) or set(selected) != expected:
+        raise ValueError("Saved AMR records and selected patterns do not agree")
+    for row in patterns.values():
+        n = row["n_present"]+row["n_absent"]
+        row["passes_maf"] = int(min(row["n_present"], row["n_absent"]) > args.maf*n)
+    log("D-only restart: skipping binary-matrix export, assembly scans, annotation collection and gzipping")
+    d_results, d_info = d_calculation(args, selected)
+    reports(args, records, state["genes_for_target"], state["rules"], patterns, d_results)
+    previous = args.out/"run_manifest.json"
+    payload = json.loads(previous.read_text(encoding="utf-8")) if previous.exists() else {}
+    payload.update(state["counts"])
+    payload.update(status="complete", stage="d", n_samples=len(samples), n_target_patterns=len(selected),
+        D=d_info, annotation_provenance=state["provenance"],
+        restart="Prepared outputs reused; no reference annotation, annotation collection or gzip export")
+    json_write(previous, payload)
+    log(f"D-only complete: {args.out/'amr_gene_summary.tsv'}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("unitigs", "fasta", "tree", "metadata", "panaroo", "bakta", "out"):
-        parser.add_argument("--"+name, required=True, type=Path)
-    contract = parser.add_mutually_exclusive_group(required=True)
+        parser.add_argument("--"+name, required=(name == "out"), type=Path)
+    contract = parser.add_mutually_exclusive_group()
     contract.add_argument("--locus-map", type=Path, help="TSV with fasta_column,locus; both zero-based")
     contract.add_argument("--fasta-columns-are-locus-ids", action="store_true", help="Explicitly assert original column i is unitig ID i")
     parser.add_argument("--sample-map", type=Path)
@@ -475,7 +593,8 @@ def main(argv=None):
     parser.add_argument("--rscript", default="Rscript")
     parser.add_argument("--zero-tip-policy", choices=["error", "epsilon"], default="error")
     parser.add_argument("--tip-epsilon", type=float, default=1e-12)
-    parser.add_argument("--stage", choices=["annotate", "all"], default="all")
+    parser.add_argument("--stage", choices=["annotate", "all", "d"], default="all",
+                        help="d reuses prepared outputs and skips annotation collection and compression")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--allow-missing-references", action="store_true", help="Explicit incomplete annotation; missing assemblies are reported")
     parser.add_argument("--no-matrix-tsv", action="store_true", help="Skip large unique-pattern matrix text export")
@@ -483,6 +602,16 @@ def main(argv=None):
     if not 0 <= args.maf < .5 or args.nearby_bp < 0 or args.permutations < 2 or args.seed < 0 or not math.isfinite(args.tip_epsilon) or args.tip_epsilon <= 0:
         parser.error("Invalid MAF, nearby distance, permutations, seed or tip epsilon")
     args.out = args.out.resolve()
+    if args.stage == "d":
+        if not args.out.is_dir():
+            parser.error("D-only restart requires an existing annotation output directory")
+        probe_r(args)
+        return restart_d(args)
+    for name in ("unitigs", "fasta", "tree", "metadata", "panaroo", "bakta"):
+        if getattr(args, name) is None:
+            parser.error(f"--{name} is required for --stage {args.stage}")
+    if not args.locus_map and not args.fasta_columns_are_locus_ids:
+        parser.error("Supply --locus-map or --fasta-columns-are-locus-ids for annotation")
     sources = [args.unitigs, args.fasta, args.tree, args.metadata, args.panaroo]
     sources += [p for p in (args.locus_map, args.sample_map, args.targets) if p]
     for path in sources:
@@ -495,13 +624,7 @@ def main(argv=None):
     import ahocorasick  # Early dependency check before large data loading.
     args.r_versions = "not_required_annotation_only"
     if args.stage == "all":
-        probe = subprocess.run([args.rscript, "--vanilla", "-e",
-            'stopifnot(requireNamespace("ape",quietly=TRUE),requireNamespace("caper",quietly=TRUE)); '
-            'cat(R.version.string,as.character(packageVersion("ape")),as.character(packageVersion("caper")),sep="\\n")'],
-            check=False, capture_output=True, text=True)
-        if probe.returncode:
-            raise ValueError(f"R dependency check failed: {probe.stderr.strip()}. Install ape/caper in this R environment, or use --stage annotate")
-        args.r_versions = probe.stdout.strip()
+        probe_r(args)
     args.out.mkdir(parents=True, exist_ok=True)
     manifest = args.out/"run_manifest.json"
     json_write(manifest, dict(status="running", interpretation="Annotation and distribution audit; no locus removal or KOVAR rerun"))
@@ -552,11 +675,14 @@ def main(argv=None):
     reports(args, records, genes_for_target, rules, patterns, {})
     # Merge indexed per-assembly evidence without loading it into memory.
     tsv_gz(args.out/"unitig_gene_hits.tsv.gz", (r for d in directories for r in read_gz(d/"hits.tsv.gz")), HIT_COLUMNS)
-    d_results, d_info = d_calculation(args, selected)
-    reports(args, records, genes_for_target, rules, patterns, d_results)
     inventory = stage_identity("unitig_audit_1", sources+[source_targets, Path(__file__)],
         dict(species=args.species, nearby_bp=args.nearby_bp, maf=args.maf, rooting=args.rooting,
              samples=samples, targets=rules, stage=args.stage), directories=[args.bakta])
+    save_annotation_state(args, records, genes_for_target, rules, patterns, inventory,
+        dict(n_unitigs=len(sequences), n_binary_loci=len(loci), n_patterns=len(patterns),
+             n_samples=len(samples), n_references=len(references), n_missing_references=len(missing)))
+    d_results, d_info = d_calculation(args, selected)
+    reports(args, records, genes_for_target, rules, patterns, d_results)
     json_write(manifest, dict(status="complete", provenance=inventory, n_unitigs=len(sequences), n_binary_loci=len(loci),
         n_patterns=len(patterns), n_target_patterns=len(selected), n_samples=len(samples),
         n_references=len(references), n_missing_references=len(missing), D=d_info,

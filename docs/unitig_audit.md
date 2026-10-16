@@ -91,10 +91,34 @@ Use a new output directory, separate from original inputs and network outputs.
 Run one writer per output directory; simultaneous runs must use separate outputs.
 
 To inspect annotation before installing/running R, add `--stage annotate`.
-The same command with `--stage all --resume` then reuses completed assembly
-annotation and starts D. Annotation-only reports have blank D values and `not_run`
-statuses. The matrix/pattern statistics and report aggregation are regenerated on
-restart; expensive assembly scans and completed D patterns are checkpointed.
+After annotation, start directly at D with:
+
+```bash
+ko-variation-unitig-audit --stage d --out /path/to/results/unitig_amr_audit \
+  --rscript /path/to/environment/bin/Rscript --resume
+```
+
+`--stage d` skips binary FASTA loading, matrix export, reference annotation,
+annotation collection and **all gzip exports**. It uses only the saved working
+tree, target binary patterns, and AMR annotation state, then updates the final
+small TSV reports. Raw-input/cohort/annotation settings are not reapplied; rerun
+annotation in a separate output directory to change those. R settings and MAF
+report flags can be changed. Add `--zero-tip-policy epsilon` when deliberately
+accepting the zero-tip numerical handling described below.
+
+New runs save `annotation_state.json` and a checksum-verified
+`annotation_ready.json` before starting D, including when D later fails. Older
+runs can import existing `amr_unitig_audit.tsv`, `amr_gene_summary.tsv`,
+`pattern_statistics.tsv`, `analysis.treefile` and `target_patterns.tsv` once.
+That import checks target/sample/count consistency and creates the new checkpoint.
+It does not read or compress assembly evidence. Because old failed runs did not
+record raw-source provenance, legacy import explicitly records that source
+identity is unverified; it adopts the saved outputs as the prepared analysis.
+Missing or inconsistent files stop the restart rather than rerunning annotation.
+
+Annotation-only reports have blank D values and `not_run` statuses. For
+`--stage all --resume`, matrix export and collection still repeat; use `--stage d`
+to bypass them. Completed D patterns remain independently checkpointed.
 Changing MAF updates report flags without changing annotation or D checkpoints.
 Changing cohort, tree, D settings, or target-pattern content gives a new D cache.
 
