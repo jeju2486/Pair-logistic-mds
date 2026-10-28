@@ -18,6 +18,35 @@ NODE_COLUMNS = ["gene", "label", "product", "group", "n_loci", "degree", "n_supp
                 "annotation_classes", "n_coding_loci", "n_nearby_loci", "annotation_distance_max_bp"]
 
 
+def discovery_network_input(frame: pd.DataFrame, summary: dict) -> pd.DataFrame:
+    """Adapt certified v0.9 edges without inventing exact P-values or refits.
+
+    The network significance column stays explicitly `p_upper`. Local and
+    unknown-distance candidates remain in the source, outside the distal map.
+    """
+    _require(frame,["u","v","significance","p_lower","p_upper","distance_status","min_distance","beta","beta_status"])
+    threshold=float(summary["raw_p_threshold"])
+    alpha=float(summary["alpha"])
+    family=int(summary["bonferroni_tests"])
+    if family<1 or not np.isfinite(threshold) or threshold<=0 or not np.isclose(threshold,alpha/family,rtol=1e-12,atol=0):
+        raise ValueError("Invalid discovery significance provenance")
+    result=frame.loc[frame.significance.eq("SIGNIFICANT") & frame.distance_status.eq("DISTAL")].copy()
+    upper=pd.to_numeric(result.p_upper,errors="raise")
+    lower=pd.to_numeric(result.p_lower,errors="raise")
+    if not np.isfinite(upper).all() or not np.isfinite(lower).all() or (lower<0).any() or (upper<lower).any() or (upper>threshold*(1+1e-12)).any():
+        raise ValueError("Discovery edge is not certified at the recorded Bonferroni cutoff")
+    result["adjusted_beta"]=pd.to_numeric(result.beta,errors="raise")
+    result["effect_status"]=result.beta_status
+    fitted=result.effect_status.eq("OK")
+    if not np.isfinite(result.loc[fitted,"adjusted_beta"]).all():
+        raise ValueError("Successful discovery beta is not finite")
+    result["adjusted_odds_ratio"]=np.nan
+    with np.errstate(over="ignore",under="ignore"):
+        result.loc[fitted,"adjusted_odds_ratio"]=np.exp(result.loc[fitted,"adjusted_beta"])
+    result["physical_distance"]=pd.to_numeric(result.min_distance,errors="raise")
+    return result
+
+
 def _annotation_classes(value):
     return set(str(value).split("; ")) if pd.notna(value) else set()
 

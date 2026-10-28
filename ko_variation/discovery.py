@@ -1,0 +1,690 @@
+"""KOVAR v0.9 unitig discovery without a SpydrPick candidate table.
+
+The hierarchy is a heuristic search; spectral bounds certify only queried
+ordinary-score decisions. All persistent work is bounded-batch and resumable.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+import itertools
+import json
+import math
+import multiprocessing
+from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import time
+import zipfile
+
+import numpy as np
+import scipy
+from scipy.stats import chi2
+from threadpoolctl import threadpool_limits
+
+from . import __version__
+from . import discovery_score as kernels
+from .discovery_store import atomic_json, connect, digest, prepare, write_gzip
+
+
+def batches(values, size):
+    source = iter(values)
+    while True:
+        batch = list(itertools.islice(source, size))
+        if not batch:
+            break
+        yield batch
+
+
+def bounded_map(pool, function, jobs, threads):
+    """Executor.map eagerly consumes iterators on Python <=3.13; do not use it."""
+    pending, source = deque(), iter(jobs)
+    for _ in range(max(1, threads*2)):
+        job = next(source, None)
+        if job is None:
+            break
+        pending.append(pool.submit(function, job))
+    while pending:
+        yield pending.popleft().result()
+        job = next(source, None)
+        if job is not None:
+            pending.append(pool.submit(function, job))
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--fasta", type=Path, required=True, help="Unique sample-ID FASTA; A=0,C=1")
+    p.add_argument("--tree", type=Path, required=True)
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--unitigs", type=Path, help="PAN-GWES zero-based unitig-ID/sequence file")
+    p.add_argument("--paths", type=Path, help="PAN-GWES per-isolate graph path list")
+    p.add_argument("--edges", type=Path, help="Global graph edges, for older unitig_distance versions")
+    p.add_argument("--unitig-distance", help="unitig_distance executable; omit to defer distances/beta")
+    p.add_argument("--kmer-length", type=int, default=61)
+    p.add_argument("--exclude-samples", type=Path, help="One sample ID per line")
+    p.add_argument("--tree-missing-samples", choices=["error", "drop"], default="error")
+    p.add_argument("--min-maf", type=float, default=.05)
+    p.add_argument("--min-cell-count", type=int, default=20, help="FINAL eligibility; proxies have no cell-count gate [20]")
+    p.add_argument("--alpha", type=float, default=.05, help="Bonferroni family-wise alpha [.05]")
+    p.add_argument("--bonferroni-tests", type=int, help="Frozen larger hypothesis family; never smaller than all pattern pairs")
+    p.add_argument("--screen-p", type=float, default=.001, help="Hierarchy exploration only, not final alpha")
+    p.add_argument("--search", choices=["hierarchy", "exhaustive"], default="hierarchy")
+    p.add_argument("--exact", action="store_true", help="Disable spectral bounds (benchmark/reference)")
+    p.add_argument("--coarse-r2", type=float, default=.8)
+    p.add_argument("--refine-r2", type=float, nargs="+", default=[.9, .95, .98, .99])
+    p.add_argument("--leaf-size", type=int, default=32)
+    p.add_argument("--rep-policy", choices=["single", "coverage"], default="single")
+    p.add_argument("--max-reps", type=int, default=10)
+    p.add_argument("--threads", type=int, default=1, help="Total CPU budget; process workers use one BLAS thread each")
+    p.add_argument("--memory-gb", type=float, default=4, help="Conservative working-memory budget; OS file cache excluded")
+    p.add_argument("--tmp-dir", type=Path, help="Persistent work directory on scratch; must survive restart")
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--distance-batch-size", type=int, default=5000)
+    p.add_argument("--distal-bp", type=int, default=10000)
+    p.add_argument("--no-beta", action="store_true", help="Keep significance/distance results without post-hoc refits")
+    p.add_argument("--reuse-nulls-from", type=Path, action="append", default=[], help="Previous v0.9 output or combined benchmark output")
+    p.add_argument("--require-cached-nulls", action="store_true")
+    p.add_argument("--resume", action="store_true", help="Reuse compatible completed work")
+    p.add_argument("--version", action="version", version=__version__)
+    return p
+
+
+def validate(args):
+    for name in ("threads", "batch_size", "distance_batch_size", "leaf_size", "max_reps", "kmer_length"):
+        if getattr(args, name) < 1:
+            raise ValueError(f"--{name.replace('_','-')} must be positive")
+    if not np.isfinite(args.memory_gb) or args.memory_gb < .25:
+        raise ValueError("--memory-gb must be finite and >=0.25")
+    if not 0 <= args.min_maf <= .5 or args.min_cell_count < 0 or args.distal_bp < 0:
+        raise ValueError("Invalid frequency/cell-count/distance threshold")
+    if not 0 < args.alpha < 1 or not 0 < args.screen_p < 1:
+        raise ValueError("Alpha and screening P must lie in (0,1)")
+    if not 0 < args.coarse_r2 < 1 or any(not args.coarse_r2 < t <= 1 for t in args.refine_r2):
+        raise ValueError("Refinement thresholds must exceed the coarse threshold and be <=1")
+    args.refine_r2 = sorted(set(args.refine_r2))
+    if args.unitig_distance and not (args.unitigs and args.paths):
+        raise ValueError("Distance calculation needs --unitigs and --paths")
+
+
+def identity(args):
+    # Execution resources can change on resume; statistical settings cannot.
+    omitted = {"threads", "memory_gb", "out", "tmp_dir", "resume", "reuse_nulls_from", "require_cached_nulls",
+               "unitig_distance", "unitigs", "paths", "edges", "kmer_length", "distal_bp", "no_beta", "distance_batch_size"}
+    settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items() if k not in omitted}
+    inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
+    code = {name: digest(Path(__file__).with_name(name)) for name in
+            ("discovery.py", "discovery_store.py", "discovery_score.py", "null_identity.py", "glmm.py", "kinship.py")}
+    from .null_identity import null_source_hash
+    return dict(version=__version__, inputs=inputs, settings=settings, code=code,
+                numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
+
+
+def schema(db):
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY,parent INTEGER,level INTEGER,
+      anchor INTEGER,size INTEGER DEFAULT 0,ready INTEGER DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS node_parent ON nodes(parent,id);
+    CREATE TABLE IF NOT EXISTS members(node INTEGER,pid INTEGER,PRIMARY KEY(node,pid)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS assigned(parent INTEGER,pid INTEGER,child INTEGER,PRIMARY KEY(parent,pid)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS reps(node INTEGER,pid INTEGER,PRIMARY KEY(node,pid)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS tasks(a INTEGER,b INTEGER,done INTEGER DEFAULT 0,PRIMARY KEY(a,b)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS pending_tasks ON tasks(done,a,b);
+    CREATE TABLE IF NOT EXISTS decisions(u INTEGER,v INTEGER,gate INTEGER,final INTEGER,
+      t_low REAL,t_high REAL,p REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS discovery_hits ON decisions(final,u,v);
+    CREATE TABLE IF NOT EXISTS external_nulls(pid INTEGER PRIMARY KEY,path TEXT);
+    CREATE TABLE IF NOT EXISTS beta(u INTEGER,v INTEGER,value REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS distance(u INTEGER,v INTEGER,pu INTEGER,pv INTEGER,
+      distance REAL,connected INTEGER,status TEXT DEFAULT 'PENDING',PRIMARY KEY(u,v)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS distance_pending ON distance(status,u,v);
+    CREATE INDEX IF NOT EXISTS distance_pattern ON distance(pu,pv,distance);
+    """)
+
+
+def get_meta(db, key, default=None):
+    row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return json.loads(row[0]) if row else default
+
+
+def set_meta(db, key, value):
+    db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, json.dumps(value, allow_nan=False)))
+
+
+def partition(db, node, threshold, pool, args, n):
+    """Greedy fixed-anchor star partition. Every membership passes directly.
+
+    Assignments are persisted as each bounded batch completes. A representative
+    can be resumed without repeating assignments from an interrupted pass.
+    """
+    last_log=time.monotonic()
+    while True:
+        active = get_meta(db, f"partition:{node}")
+        lower_seed = get_meta(db,f"partition_next:{node}",0)
+        row = db.execute("SELECT m.pid FROM members m LEFT JOIN assigned a ON a.parent=m.node AND a.pid=m.pid "
+                         "WHERE m.node=? AND m.pid>=? AND a.pid IS NULL ORDER BY m.pid LIMIT 1", (node,lower_seed)).fetchone()
+        if row is None and active is None:
+            break
+        representative = active[0] if active else row[0]
+        # Recover an unfinished representative pass after an interruption.
+        child = db.execute("SELECT id FROM nodes WHERE parent=? AND anchor=?", (node, representative)).fetchone()
+        if child:
+            child = child[0]
+        else:
+            level = db.execute("SELECT level FROM nodes WHERE id=?", (node,)).fetchone()[0]+1
+            with db:
+                child = db.execute("INSERT INTO nodes(parent,level,anchor) VALUES (?,?,?)", (node, level, representative)).lastrowid
+        with db:
+            set_meta(db, f"partition:{node}", [representative,child])
+        k = db.execute("SELECT present FROM patterns WHERE id=?",(representative,)).fetchone()[0]
+        # Necessary positive-phi margin bounds: impossible membership is never
+        # sent to a worker. This is exact, unlike representative hit pruning.
+        lo = max(1,math.ceil(n*threshold*k/(n-k+threshold*k)-1e-10))
+        hi = min(n-1,math.floor(n*k/(threshold*(n-k)+k)+1e-10))
+        cursor = db.execute("SELECT m.pid FROM patterns p JOIN members m ON m.pid=p.id "
+                            "LEFT JOIN assigned a ON a.parent=m.node AND a.pid=m.pid "
+                            "WHERE m.node=? AND a.pid IS NULL AND p.present BETWEEN ? AND ? ORDER BY m.pid", (node,lo,hi))
+        jobs = ((representative, [r[0] for r in batch], threshold) for batch in batches(cursor, args.batch_size))
+        for matches in bounded_map(pool, kernels.similarity, jobs, args.threads):
+            with db:
+                db.executemany("INSERT OR IGNORE INTO assigned VALUES (?,?,?)", ((node, p, child) for p in matches))
+            if time.monotonic()-last_log>25:
+                print(f"[KOVAR] category node={node}; representative={representative}; assigning batches",flush=True)
+                last_log=time.monotonic()
+        with db:
+            db.execute("INSERT OR IGNORE INTO members SELECT child,pid FROM assigned WHERE parent=? AND child=?", (node, child))
+            db.execute("UPDATE nodes SET size=(SELECT count(*) FROM members WHERE node=?) WHERE id=?", (child, child))
+            db.execute("DELETE FROM meta WHERE key=?", (f"partition:{node}",))
+            set_meta(db,f"partition_next:{node}",representative+1)
+        # Progress once per representative, also visible for very large pools.
+        if child % 100 == 0:
+            print(f"[KOVAR] categories: node={node}; latest child={child}", flush=True)
+    with db:
+        db.execute("UPDATE nodes SET ready=1 WHERE id=?", (node,))
+
+
+def make_hierarchy(db, info, pool, args):
+    if get_meta(db, "hierarchy_complete"):
+        return
+    with db:
+        db.execute("INSERT OR IGNORE INTO nodes(id,parent,level,anchor,size) VALUES (0,NULL,-1,0,?)", (info["patterns"],))
+        db.execute("INSERT OR IGNORE INTO members SELECT 0,id FROM patterns")
+    thresholds = [args.coarse_r2]+args.refine_r2
+    while True:
+        row = db.execute("SELECT id,level,size FROM nodes WHERE ready=0 ORDER BY id LIMIT 1").fetchone()
+        if row is None:
+            break
+        node, level, size = row
+        if node and size <= args.leaf_size:
+            with db:
+                db.execute("UPDATE nodes SET ready=1 WHERE id=?", (node,))
+        elif level+1 < len(thresholds):
+            partition(db, node, thresholds[level+1], pool, args,info["n"])
+        else:
+            # Final chunks are computational leaves, not biological categories.
+            with db:
+                for batch in batches(db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid", (node,)), args.leaf_size):
+                    child = db.execute("INSERT INTO nodes(parent,level,anchor,size,ready) VALUES (?,?,?,?,1)",
+                                       (node, level+1, batch[0][0], len(batch))).lastrowid
+                    db.executemany("INSERT INTO members VALUES (?,?)", ((child, p[0]) for p in batch))
+                db.execute("UPDATE nodes SET ready=1 WHERE id=?", (node,))
+    # Mean correlation to all members equals a dot product with their summed
+    # standardized vectors. A central observed representative therefore costs
+    # O(n*members), not a dense members-by-members correlation matrix.
+    for node, anchor, size in db.execute("SELECT id,anchor,size FROM nodes WHERE id>0 ORDER BY id"):
+        width = 1 if args.rep_policy == "single" else max(1, min(math.ceil(size*.01), args.max_reps))
+        selected = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=? ORDER BY pid", (node,))]
+        if not selected and size==1:
+            with db:
+                db.execute("INSERT INTO reps VALUES (?,?)",(node,anchor))
+            continue
+        if not selected:
+            total=np.zeros(info["n"])
+            jobs=([r[0] for r in batch] for batch in batches(db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid",(node,)),args.batch_size))
+            for vector in bounded_map(pool,kernels.standardized_sum,jobs,args.threads):
+                total+=vector
+            jobs=(([r[0] for r in batch],total) for batch in batches(db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid",(node,)),args.batch_size))
+            _,representative=min(bounded_map(pool,kernels.central,jobs,args.threads))
+            selected=[representative]
+            with db:
+                db.execute("INSERT INTO reps VALUES (?,?)",(node,representative))
+        while len(selected) < width:
+            cursor = db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid", (node,))
+            jobs = (([r[0] for r in batch], selected) for batch in batches(cursor, args.batch_size))
+            pick = min(bounded_map(pool, kernels.farthest, jobs, args.threads))
+            if pick[1] < 0:
+                break
+            selected.append(pick[1])
+            with db:
+                db.execute("INSERT INTO reps VALUES (?,?)", (node, pick[1]))
+    with db:
+        set_meta(db, "hierarchy_complete", True)
+
+
+def evaluate(db, pairs, pool, args, screening=False):
+    # The caller supplies at most one task block, never the entire pair pool.
+    requested = sorted({tuple(sorted((int(u), int(v)))) for u, v in pairs if u != v}, key=lambda pair:(pair[1],pair[0]))
+    missing=[]
+    for pair in requested:
+        row=db.execute("SELECT status FROM decisions WHERE u=? AND v=?",pair).fetchone()
+        if row is None or screening and row[0]=="INELIGIBLE_NOT_SCREENED":
+            missing.append(pair)
+    def jobs():
+        for response, group in itertools.groupby(missing, key=lambda pair:pair[1]):
+            external = db.execute("SELECT path FROM external_nulls WHERE pid=?", (response,)).fetchone()
+            # Exactly one active job per response, internally chunked by worker.
+            yield response, [pair[0] for pair in group], external[0] if external else None,screening
+    for result in bounded_map(pool, kernels.score, jobs(), args.threads):
+        with db:
+            db.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?)", result)
+    return [db.execute("SELECT gate,final FROM decisions WHERE u=? AND v=?", pair).fetchone() for pair in requested]
+
+
+def search(db, info, pool, args):
+    if get_meta(db, "search_complete"):
+        return
+    started, last = time.monotonic(), 0.
+    if args.search == "exhaustive":
+        response, offset = get_meta(db, "exhaustive_cursor", [1,0])
+        while response < info["patterns"]:
+            for first in range(offset, response, args.batch_size):
+                evaluate(db, ((u,response) for u in range(first,min(response,first+args.batch_size))), pool, args)
+                with db:
+                    set_meta(db, "exhaustive_cursor", [response, min(response,first+args.batch_size)])
+            response, offset = response+1, 0
+            if time.monotonic()-last > 25:
+                print(f"[KOVAR] exhaustive: {response:,}/{info['patterns']:,} responses", flush=True)
+                last = time.monotonic()
+    else:
+        if not get_meta(db, "search_initialized"):
+            with db:
+                db.execute("INSERT OR IGNORE INTO tasks SELECT id,id,0 FROM nodes WHERE parent=0")
+                set_meta(db, "root_cursor", [0,1])
+                set_meta(db, "search_initialized", True)
+        # Only root IDs, O(categories), are kept in RAM; root-pair lists are not.
+        roots = [r[0] for r in db.execute("SELECT id FROM nodes WHERE parent=0 ORDER BY id")]
+        while True:
+            tasks = db.execute("SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT 128").fetchall()
+            if not tasks:
+                i,j = get_meta(db, "root_cursor")
+                new = []
+                while i < len(roots)-1 and len(new) < 128:
+                    new.append((roots[i], roots[j]))
+                    j += 1
+                    if j == len(roots):
+                        i,j = i+1,i+2
+                if not new:
+                    break
+                with db:
+                    db.executemany("INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)", new)
+                    set_meta(db, "root_cursor", [i,j])
+                tasks = new
+            # Route a bounded frontier together to improve response/null reuse.
+            gates = []
+            for a,b in tasks:
+                if a != b:
+                    ra = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=?", (a,))]
+                    rb = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=?", (b,))]
+                    gates.extend(itertools.product(ra,rb))
+            evaluate(db, gates, pool, args,screening=True)
+            for a,b in tasks:
+                ca = [r[0] for r in db.execute("SELECT id FROM nodes WHERE parent=? ORDER BY id", (a,))]
+                cb = [r[0] for r in db.execute("SELECT id FROM nodes WHERE parent=? ORDER BY id", (b,))]
+                expand = True
+                if a != b:
+                    ra = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=?", (a,))]
+                    rb = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=?", (b,))]
+                    states = evaluate(db, itertools.product(ra,rb), pool, args,screening=True)
+                    expand = any(gate != -1 for gate,_ in states)
+                children = []
+                if expand:
+                    if a == b and ca:
+                        children = itertools.combinations_with_replacement(ca,2)
+                    elif ca or cb:
+                        size_a = db.execute("SELECT size FROM nodes WHERE id=?", (a,)).fetchone()[0]
+                        size_b = db.execute("SELECT size FROM nodes WHERE id=?", (b,)).fetchone()[0]
+                        children = [(c,b) for c in ca] if ca and (not cb or size_a >= size_b) else [(a,c) for c in cb]
+                    else:
+                        ma = [r[0] for r in db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid", (a,))]
+                        mb = ma if a == b else [r[0] for r in db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid", (b,))]
+                        leaf_pairs = itertools.combinations(ma,2) if a == b else itertools.product(ma,mb)
+                        for block in batches(leaf_pairs,args.batch_size):
+                            evaluate(db, block, pool, args)
+                # Task completion and child insertion are one atomic transaction.
+                with db:
+                    db.executemany("INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)", (tuple(sorted(pair)) for pair in children))
+                    db.execute("UPDATE tasks SET done=1 WHERE a=? AND b=?", (a,b))
+            if time.monotonic()-last > 25:
+                count = db.execute("SELECT count(*) FROM decisions").fetchone()[0]
+                print(f"[KOVAR] search: {count:,} queried pattern pairs; {time.monotonic()-started:.0f}s this invocation", flush=True)
+                last = time.monotonic()
+    with db:
+        set_meta(db, "search_complete", True)
+
+
+def import_nulls(db, work, info, args):
+    """Reuse v0.9 caches, or explicitly verify the former benchmark preparation.
+
+    NPZ preparation components are extracted to disk before mapping, rather
+    than loading the entire former unitig pool into RAM.
+    """
+    sources,seen = deque(args.reuse_nulls_from),set()
+    while sources:
+        supplied = sources.popleft()
+        supplied = supplied.resolve()
+        if supplied in seen:
+            continue
+        seen.add(supplied)
+        if get_meta(db, "imported:"+str(supplied)):
+            # A prior import may have committed before its borrowed-source
+            # imports finished. Follow those links again on resume.
+            source_root=supplied.parent if supplied.name=="null_models" else supplied
+            if (source_root/"run_identity.json").exists():
+                source_identity=json.loads((source_root/"run_identity.json").read_text())
+                sources.extend(Path(item["path"]) for item in source_identity.get("reused_null_sources",[]))
+            continue
+        root = supplied.parent if supplied.name == "null_models" else supplied
+        prior_identity=json.loads((root/"run_identity.json").read_text())
+        if str(prior_identity.get("version","")).startswith("0.9."):
+            current_identity=identity(args)
+            if any(prior_identity.get(k)!=current_identity.get(k) for k in ("numpy","scipy","null_model_source_sha256")):
+                raise ValueError("Prior v0.9 null-fitting environment/source differs")
+            summary = json.loads((root/"run_summary.json").read_text()) if (root/"run_summary.json").exists() else {}
+            prior_work = Path(summary.get("work_directory",prior_identity.get("work_directory",root/".kovar_work")))
+            prior_info=json.loads((prior_work/"prepared.json").read_text())
+            if (prior_info["samples"]!=info["samples"] or
+                    any(prior_info["products"][k]!=info["products"][k] for k in ("patterns.bin","K.npy"))):
+                raise ValueError("Prior prepared patterns/covariance differ")
+            for meta in (prior_work/"null_models").glob("*/null_*.json"):
+                record = json.loads(meta.read_text())
+                with db:
+                    db.execute("INSERT OR IGNORE INTO external_nulls VALUES (?,?)", (record["pattern"], str(meta)))
+            borrowed=sqlite3.connect((prior_work/"work.sqlite").resolve().as_uri()+"?mode=ro",uri=True)
+            try:
+                for batch in batches(borrowed.execute("SELECT pid,path FROM external_nulls"),1000):
+                    with db:
+                        db.executemany("INSERT OR IGNORE INTO external_nulls VALUES (?,?)",batch)
+            finally:
+                borrowed.close()
+        else:
+            prior = json.loads((root/"run_identity.json").read_text())
+            # v2 borrowed most models in place from v1; follow those verified
+            # provenance links rather than importing only the newly fitted ones.
+            for source in prior.get("reused_null_sources",[]):
+                sources.append(Path(source["path"]))
+            old_preparation = Path(prior["settings"]["benchmark_dir"])/"preparation.npz"
+            if not old_preparation.exists():
+                raise ValueError(f"Previous benchmark preparation is required for safe reuse: {old_preparation}")
+            from .null_identity import null_source_hash, LEGACY_GLMM_HASHES, LEGACY_NULL_SOURCE
+            current = null_source_hash()
+            source = prior.get("null_model_source_sha256")
+            if source != current:
+                hashes = [r.get("sha256") for r in prior.get("inputs",[]) if r.get("name")=="glmm.py"]
+                # Some legacy identities store the scorer hash separately.
+                hashes += [prior.get("glmm_source_sha256"), prior.get("glmm_sha256"),prior.get("code",{}).get("glmm.py")]
+                if not (current == LEGACY_NULL_SOURCE and any(h in LEGACY_GLMM_HASHES for h in hashes)):
+                    raise ValueError("Prior benchmark null-fitting code is not verified compatible")
+            versions = prior.get("versions",prior)
+            if versions.get("numpy") != np.__version__ or versions.get("scipy") != scipy.__version__:
+                raise ValueError("Prior benchmark NumPy/SciPy versions differ")
+            if prior["settings"].get("null_max_iter") != 100 or prior["settings"].get("null_tolerance") != 1e-7:
+                raise ValueError("Prior null fitting settings differ")
+            expected = [r["sha256"] for r in prior["inputs"] if r["name"] == "preparation.npz"]
+            if expected != [digest(old_preparation)]:
+                raise ValueError("Previous benchmark preparation changed")
+            extracted = work/"import_preparation"
+            extracted.mkdir(exist_ok=True)
+            with zipfile.ZipFile(old_preparation) as archive:
+                for name in ("samples.npy", "K.npy", "packed.npy"):
+                    with archive.open(name) as source_file, (extracted/name).open("wb") as target:
+                        shutil.copyfileobj(source_file,target,1<<20)
+            if (list(np.load(extracted/"samples.npy", mmap_mode="r")) != info["samples"] or
+                    not np.array_equal(np.load(extracted/"K.npy", mmap_mode="r"), np.load(work/"K.npy", mmap_mode="r"))):
+                raise ValueError("Previous sample order/covariance differs; reuse rejected")
+            packed = np.load(extracted/"packed.npy", mmap_mode="r")
+            for meta in (root/"null_models").glob("null_*.json"):
+                old_pattern = json.loads(meta.read_text())["pattern"]
+                row = db.execute("SELECT id FROM patterns WHERE bits=?", (packed[old_pattern].tobytes(),)).fetchone()
+                if row:
+                    with db:
+                        db.execute("INSERT OR IGNORE INTO external_nulls VALUES (?,?)", (row[0],str(meta)))
+            del packed
+            for path in extracted.iterdir():
+                path.unlink()
+            extracted.rmdir()
+        with db:
+            set_meta(db,"imported:"+str(supplied),True)
+
+
+def distance_and_beta(db, work, pool, args):
+    if not args.unitig_distance:
+        return
+    binary = shutil.which(args.unitig_distance)
+    if binary is None:
+        raise ValueError(f"unitig_distance executable not found: {args.unitig_distance}")
+    help_result = subprocess.run([binary,"--help"],capture_output=True,text=True,check=False)
+    help_text = (help_result.stdout or "")+(help_result.stderr or "")
+    # Freeze distance inputs separately, so distances can be added on a resume.
+    graph = {name: digest(getattr(args,name)) for name in ("unitigs","paths","edges") if getattr(args,name)}
+    # .paths entries are resolved exactly as the executable will see them.
+    graph["path_graphs"] = []
+    with args.paths.open() as stream:
+        for line in stream:
+            if line.strip():
+                path = Path(line.strip()).resolve()
+                graph["path_graphs"].append([str(path),digest(path)])
+    graph.update(binary=digest(binary),k=args.kmer_length,distal_bp=args.distal_bp)
+    old = get_meta(db,"distance_identity")
+    if old is not None and old != graph:
+        raise ValueError("Distance inputs/settings changed; use a new output")
+    with db:
+        set_meta(db,"distance_identity",graph)
+    if not get_meta(db,"distance_expanded"):
+        with db:
+            db.execute("INSERT OR IGNORE INTO distance(u,v,pu,pv) "
+                       "SELECT min(a.id,b.id),max(a.id,b.id),d.u,d.v FROM decisions d "
+                       "JOIN unitigs a ON a.pattern=d.u JOIN unitigs b ON b.pattern=d.v WHERE d.final=1")
+            set_meta(db,"distance_expanded",True)
+    directory = work/"distance"
+    directory.mkdir(exist_ok=True)
+    while True:
+        rows = db.execute("SELECT u,v FROM distance WHERE status='PENDING' ORDER BY u,v LIMIT ?",(args.distance_batch_size,)).fetchall()
+        if not rows:
+            break
+        import uuid
+        stem = directory/("batch_"+uuid.uuid4().hex)
+        query = stem.with_suffix(".queries")
+        with query.open("w") as stream:
+            for u,v in rows:
+                stream.write(f"{u} {v} -1 0 0\n")
+        command = [binary,"--unitigs-file",str(args.unitigs.resolve()),"--sgg-paths-file",str(args.paths.resolve()),
+                   "--k-mer-length",str(args.kmer_length),"--queries-file",str(query.resolve()),
+                   "--threads",str(args.threads),"--output-stem",str(stem.resolve())]
+        if "--edges-file" in help_text:
+            if not args.edges:
+                raise ValueError("This unitig_distance version requires --edges")
+            command += ["--edges-file",str(args.edges.resolve())]
+        if "--run-sggs-only" in help_text:
+            command += ["--run-sggs-only"]
+        if "--memory" in help_text:
+            # Keep headroom for the coordinator and idle numerical workers.
+            command += ["--memory",f"{max(1,int(args.memory_gb*1024*.4))}M"]
+        log_path = stem.with_suffix(".log")
+        print(f"[KOVAR] distance batch: {len(rows):,} pairs; log: {log_path}",flush=True)
+        with log_path.open("w") as stream:
+            subprocess.run(command,stdout=stream,stderr=subprocess.STDOUT,check=True)
+        outputs = [p for p in directory.glob(stem.name+".ud*") if p.is_file()]
+        if len(outputs) != 1:
+            raise ValueError(f"Expected one zero-based distance output, found {outputs}; see {log_path}")
+        expected = set(rows)
+        found = set()
+        with db, outputs[0].open() as stream:
+            for line in stream:
+                fields = line.split()
+                if not fields or fields[0].startswith("#"):
+                    continue
+                if len(fields) < 9:
+                    raise ValueError("Expected PAN-GWES distance output with min_distance in column 8")
+                u,v = sorted((int(fields[0]),int(fields[1])))
+                if (u,v) not in expected or (u,v) in found:
+                    raise ValueError("Unexpected/duplicate distance pair")
+                found.add((u,v))
+                count, distance = int(fields[5]),float(fields[7])
+                valid = count > 0 and np.isfinite(distance) and distance >= 0
+                status = "DISTAL" if valid and distance > args.distal_bp else "LOCAL" if valid else "UNKNOWN"
+                db.execute("UPDATE distance SET distance=?,connected=?,status=? WHERE u=? AND v=?",
+                           (distance if valid else None,count,status,u,v))
+            if found != expected:
+                raise ValueError("Distance output did not cover the complete query batch")
+        for product in (query,outputs[0],log_path):
+            product.unlink()
+        print(f"[KOVAR] distance: committed {len(rows):,} unitig pairs",flush=True)
+    if not args.no_beta:
+        cursor = db.execute("SELECT DISTINCT d.pu,d.pv FROM distance d LEFT JOIN beta b ON b.u=d.pu AND b.v=d.pv "
+                            "WHERE d.status='DISTAL' AND b.u IS NULL ORDER BY d.pv,d.pu")
+        jobs = ((u,v) for u,v in cursor)
+        completed,last=0,time.monotonic()
+        for row in bounded_map(pool,kernels.beta,jobs,args.threads):
+            with db:
+                db.execute("INSERT OR IGNORE INTO beta VALUES (?,?,?,?)",row)
+            completed+=1
+            if time.monotonic()-last>25:
+                print(f"[KOVAR] beta: {completed:,} pattern pairs committed this invocation",flush=True)
+                last=time.monotonic()
+
+
+def export(db, info, work, args, total_seconds):
+    args.out.mkdir(exist_ok=True,parents=True)
+    write_gzip(args.out/"unitigs.tsv.gz", ["unitig_id","pattern_id","present","n_samples","sequence_source"],
+               ((u,p,k,info["n"],str(args.unitigs.resolve()) if args.unitigs else "")
+                for u,p,k in db.execute("SELECT id,pattern,present FROM unitigs ORDER BY id")))
+    def rows():
+        query = """SELECT min(a.id,b.id),max(a.id,b.id),d.u,d.v,d.p,d.t_low,d.t_high,
+          x.distance,x.connected,coalesce(x.status,'NOT_CALCULATED'),beta.value,beta.status
+          FROM decisions d JOIN unitigs a ON a.pattern=d.u JOIN unitigs b ON b.pattern=d.v
+          LEFT JOIN distance x ON x.u=min(a.id,b.id) AND x.v=max(a.id,b.id)
+          LEFT JOIN beta ON beta.u=d.u AND beta.v=d.v WHERE d.final=1"""
+        for u,v,pu,pv,p,lo,hi,distance,count,status,beta,beta_status in db.execute(query):
+            # Never present statistic/P-value bounds as an exact P-value.
+            yield (u,v,pu,pv,"SIGNIFICANT",p,float(chi2.sf(hi,1)) if hi is not None else None,
+                   float(chi2.sf(lo,1)) if lo is not None else None,distance,count,status,
+                   beta if status=="DISTAL" else None,
+                   beta_status if status=="DISTAL" and beta_status else "NOT_REQUESTED" if status=="DISTAL" else "SKIPPED_"+status)
+    write_gzip(args.out/"associations.tsv.gz",
+        ["u","v","predictor_pattern","response_pattern","significance","p_exact","p_lower","p_upper",
+         "min_distance","connected_genomes","distance_status","beta","beta_status"],rows())
+    counts = {str(state):count for state,count in db.execute("SELECT final,count(*) FROM decisions GROUP BY final")}
+    family = args.bonferroni_tests or math.comb(info["patterns"],2)
+    summary = dict(version=__version__,work_directory=str(work.resolve()),
+        samples=info["n"],excluded_samples=info["excluded"],original_unitigs=info["loci"],
+        unique_patterns=info["patterns"],bonferroni_tests=family,alpha=args.alpha,
+        raw_p_threshold=args.alpha/family,screen_p=args.screen_p,
+        final_min_cell_count=args.min_cell_count,spa="off",search=args.search,
+        representative_pruning_is_heuristic=args.search=="hierarchy",counts_by_final_decision=counts,
+        decisions={"1":"significant","-1":"nonsignificant","0":"unresolved","-2":"ineligible"},
+        within_exact_pattern_pairs="deterministic redundancy; not assigned a score-test P-value",
+        statistic_orientation="lower pattern ID predictor; higher pattern ID response",
+        original_ids="zero-based FASTA columns, never renumbered by filtering",
+        threads=args.threads,memory_gb=args.memory_gb,seconds_this_invocation=total_seconds,
+        distance_status_counts=dict(db.execute("SELECT status,count(*) FROM distance GROUP BY status")),
+        beta_status_counts=dict(db.execute("SELECT status,count(*) FROM beta GROUP BY status")),
+        queried_pairs=sum(counts.values()),total_pattern_pairs=math.comb(info["patterns"],2),
+        unqueried_pairs=math.comb(info["patterns"],2)-sum(counts.values()))
+    null_statuses={}
+    null_seconds=0.
+    for meta in (work/"null_models").glob("*/null_*.json"):
+        record=json.loads(meta.read_text())
+        null_statuses[record["status"]]=null_statuses.get(record["status"],0)+1
+        null_seconds+=record["fit_seconds"]
+    summary.update(saved_local_null_statuses=null_statuses,
+                   saved_local_null_fit_seconds=null_seconds,
+                   available_imported_nulls=db.execute("SELECT count(*) FROM external_nulls").fetchone()[0])
+    atomic_json(args.out/"run_summary.json",summary)
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    validate(args)
+    started = time.monotonic()
+    args.out = args.out.resolve()
+    args.out.mkdir(parents=True,exist_ok=True)
+    work = args.tmp_dir.resolve() if args.tmp_dir else args.out/".kovar_work"
+    output_identity=args.out/"run_identity.json"
+    if output_identity.exists():
+        existing=json.loads(output_identity.read_text())
+        if existing.get("work_directory") and Path(existing["work_directory"]).resolve()!=work.resolve():
+            raise ValueError("Output belongs to another work directory; restore the original --tmp-dir")
+    elif any(args.out.iterdir()):
+        raise ValueError("Nonempty output is not an existing discovery run; choose a new --out")
+    work.mkdir(parents=True,exist_ok=True)
+    # An OS-released SQLite transaction lock prevents concurrent coordinators,
+    # including on shared HPC storage. No stale PID lock needs manual removal.
+    lock = sqlite3.connect(work/"coordinator.lock.sqlite",timeout=0)
+    lock.execute("CREATE TABLE IF NOT EXISTS lock(id INTEGER)")
+    try:
+        lock.execute("BEGIN EXCLUSIVE")
+    except sqlite3.OperationalError as error:
+        raise ValueError("Another coordinator is using this work directory") from error
+    try:
+        expected = identity(args)
+        manifest = work/"run_identity.json"
+        if manifest.exists():
+            if not args.resume:
+                raise ValueError("Existing work requires --resume")
+            if json.loads(manifest.read_text()) != expected:
+                raise ValueError("Input/code/statistical settings changed; use a new output")
+        else:
+            atomic_json(manifest,expected)
+        atomic_json(args.out/"run_identity.json",dict(expected,work_directory=str(work)))
+        db = connect(work/"work.sqlite",min(64,args.memory_gb*1024*.05))
+        try:
+            schema(db)
+            with threadpool_limits(limits=args.threads):
+                info = prepare(args,db,work)
+            family = math.comb(info["patterns"],2)
+            if args.bonferroni_tests is not None and args.bonferroni_tests < family:
+                raise ValueError("Bonferroni family cannot be smaller than all unique-pattern pairs")
+            family = args.bonferroni_tests or family
+            if args.screen_p < args.alpha/family:
+                raise ValueError("Screening gate must be at least as permissive as final significance")
+            import_nulls(db,work,info,args)
+            n = info["n"]
+            # Conservative allocation for eigensolvers, PQL temporaries and one
+            # bounded predictor block. Mapped pattern pages are not duplicated.
+            per_worker = 160*n*n + 80*n*args.batch_size + (48<<20)
+            budget = args.memory_gb*(1<<30)
+            coordinator = (96<<20)+64*1024**2
+            if args.threads*per_worker+coordinator > budget:
+                raise ValueError(f"Memory budget too small for {args.threads} workers/{n} samples; "
+                                 f"request at least {(args.threads*per_worker+coordinator)/(1<<30):.2f} GiB or fewer --threads")
+            ram_nulls = max(1,min(32,int((budget-coordinator-args.threads*per_worker)/args.threads/max(24*n*n,1))))
+            settings = dict(min_cell_count=args.min_cell_count,gate_critical=float(chi2.isf(args.screen_p,1)),
+                            final_critical=float(chi2.isf(args.alpha/family,1)),exact=args.exact,
+                            ram_nulls=ram_nulls,require_cached_nulls=args.require_cached_nulls,batch_size=args.batch_size)
+            print(f"[KOVAR {__version__}] {info['patterns']:,} patterns; {family:,} hypotheses; "
+                  f"final P <= {args.alpha/family:.6g}; workers={args.threads}; null RAM slots/worker={ram_nulls}",flush=True)
+            print("[KOVAR] null cache upper storage estimate: "
+                  f"{info['patterns']*12*n*n/(1<<30):.1f} GiB if every response is fitted; "
+                  "pair checkpoints and expanded unitig results require additional disk space",flush=True)
+            # Spawn is portable and avoids forking live numerical thread pools.
+            with ProcessPoolExecutor(max_workers=args.threads,mp_context=multiprocessing.get_context("spawn"),
+                    initializer=kernels.initialize,initargs=(str(work),info,settings)) as pool:
+                if args.search=="hierarchy":
+                    make_hierarchy(db,info,pool,args)
+                search(db,info,pool,args)
+                distance_and_beta(db,work,pool,args)
+            export(db,info,work,args,time.monotonic()-started)
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            db.close()
+    finally:
+        lock.rollback()
+        lock.close()
+    print(f"[KOVAR] complete: {args.out}",flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    main()

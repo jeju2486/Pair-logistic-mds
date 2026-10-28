@@ -6,7 +6,13 @@ sample covariance, a binary logistic mixed-model null fit, and a score test.
 The output is evidence against no adjusted association; it is not an effect
 size, a causal direction, or proof of biological epistasis.
 
-Version 0.8.3 reports one result for each unordered pair. The separate
+Version 0.9.0 adds direct unitig discovery without SpydrPick, disk-backed
+hierarchical search, adaptive significance bounds and persistent null reuse.
+It retains significant local pairs and estimates beta only for confirmed distal
+pairs. See the [v0.9 discovery guide](docs/discovery.md) for inputs, CPU/memory
+controls, restart, and the heuristic limits of representative pruning.
+
+The legacy candidate-table scanner reports one result for each unordered pair. The separate
 `ko-variation-annotation` helper selects distal significant signals, calculates
 phylogeny-adjusted alternative-model odds ratios, and exports annotated gene networks.
 See [downstream usage and interpretation](docs/downstream.md).
@@ -14,7 +20,7 @@ See [downstream usage and interpretation](docs/downstream.md).
 ## Installation
 
 ```bash
-git clone --branch feature/downstream-helpers https://github.com/jeju2486/Pair-logistic-mds.git
+git clone --branch v0.9.0 https://github.com/jeju2486/Pair-logistic-mds.git
 cd Pair-logistic-mds
 pip install -e .
 ko-variation --version
@@ -24,6 +30,25 @@ Python 3.10 or newer is required. KOVAR depends on NumPy, pandas, SciPy, and
 threadpoolctl.
 
 ## Quick start
+
+Direct discovery from PAN-GWES parser outputs:
+
+```bash
+ko-variation discover \
+  --fasta graph.sample_ids.fasta --tree rooted_tree.nwk \
+  --unitigs graph.unitigs --paths graph.paths \
+  --unitig-distance /path/to/unitig_distance --kmer-length 61 \
+  --out kovar_results --threads 4 --memory-gb 4
+```
+
+Final selection uses Bonferroni-adjusted P <=0.05. Exact P-values are optional:
+certified significance decisions select edges. Local (<=10kb) significant pairs
+remain in the table without beta. Repeat with `--resume` to continue.
+Representative screening can miss associations; `--search exhaustive` removes
+that heuristic while retaining adaptive bounds. No dense all-pairs matrix is
+created. [Full instructions and cache reuse](docs/discovery.md).
+
+Existing candidate-table scans remain available:
 
 ```bash
 ko-variation \
@@ -56,7 +81,7 @@ out-of-range loci stop the run. Candidate rows are not filtered by MI inside
 KOVAR.
 
 `--tree` must be a rooted Newick tree with branch lengths. Tip labels must match
-FASTA sample names exactly. KOVAR does not build a fallback GRM in 0.8.3.
+FASTA sample names exactly. KOVAR does not build a fallback GRM.
 
 By default, a FASTA sample absent from the tree stops the run before candidate
 pairs are loaded. To deliberately analyze the intersection, add
@@ -174,6 +199,10 @@ alias-aware search, gene-name labels, and eggNOG/GO metadata on existing maps.
 
 ## Checkpoint and resume
 
+For v0.9 discovery, see [disk-backed restart and saved null reuse](docs/discovery.md).
+One focused production-path benchmark replaces the historical standalone
+screening prototypes: `benchmarks/discovery_benchmark.py`.
+
 Checkpointing is automatic. Atomic score-stage shards are written to
 `OUT/.kovar_checkpoint` unless `--checkpoint-dir` is supplied. A resume is
 accepted only when input fingerprints, version, numerical environment, and
@@ -185,9 +214,10 @@ successfully written.
 A small p-value identifies a phylogeny-adjusted covariation candidate. It does
 not distinguish functional epistasis from physical linkage, co-transfer,
 shared ecological selection, annotation artifacts, or residual population
-structure. The candidate generator also limits discovery: a biologically
-important pair absent from the supplied PAN-GWES/SpydrPick list cannot be
-recovered by KOVAR.
+structure. The legacy candidate-table mode cannot recover pairs absent from its
+input. Direct discovery bypasses that shortlist, but its default representative
+hierarchy can miss significant member pairs. Adaptive bounds certify only
+queried ordinary-score decisions, conditional on the fitted null.
 
 The PQL and SPA implementations remain experimental. Calibration should be
 checked by simulation over the intended sample sizes, frequencies, tree shapes,
@@ -209,6 +239,17 @@ See `docs/model.md`, `docs/interpretation.md`, and `docs/research_basis.md` for
 more detail.
 
 ## Version history
+
+### 0.9.0
+
+- direct PAN-GWES unitig input without MI or ARACNE;
+- exact-pattern compression with original-unitig mappings;
+- global representative hierarchy and adaptive ordinary-score bounds;
+- optimized exact fallback, response-major parallel workers and cached nulls;
+- mapped arrays, bounded queues and disk-backed stage checkpoints;
+- all significant candidates retained, with post-hoc beta restricted to >10kb;
+- compact compressed results and explicit significance/distance/effect statuses;
+- consolidated production benchmark and removal of superseded prototypes.
 
 ### 0.8.3
 

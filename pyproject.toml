@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ko-variation"
-version = "0.8.3"
+version = "0.9.0"
 description = "KOVAR: phylogeny-adjusted pangenome covariation score testing"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ audit = ["biopython>=1.81", "pyahocorasick>=2.1"]
 
 [project.scripts]
 ko-variation = "ko_variation.cli:main"
+ko-variation-discover = "ko_variation.discovery:main"
 ko-variation-plot = "ko_variation.plot_cli:main"
 ko-variation-annotation = "ko_variation.annotation_cli:main"
 ko-variation-select = "ko_variation.selection_cli:main"

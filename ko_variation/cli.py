@@ -33,7 +33,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "KOVAR: unordered pangenome covariation scanning with a "
-            "phylogeny-adjusted logistic mixed-model score test."
+            "phylogeny-adjusted logistic mixed-model score test. "
+            "For direct unitig discovery without --pairs: ko-variation discover --help."
         )
     )
     parser.add_argument("--fasta", required=True, help="Binary fake FASTA with A=0 and C=1.")
@@ -89,7 +90,7 @@ def parse_args(argv=None):
         parser.error("--min-cell-count must be non-negative")
     if args.threads < 1:
         parser.error("--threads must be positive")
-    # Numerical and checkpoint tuning are intentionally internal in 0.8.3.
+    # Low-level legacy candidate-scan tuning remains internal.
     args.presence_char = "C"
     args.absence_char = "A"
     args.tree_missing_length = "error"
@@ -183,8 +184,12 @@ def _metadata_rows(
 
 
 def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "discover":
+        from .discovery import main as discover
+        return discover(arguments[1:])
     started = time.time()
-    args = parse_args(argv)
+    args = parse_args(arguments)
     runtime = collect_parallel_runtime(args.threads)
     out = Path(args.out)
     if out.exists() and any(out.iterdir()) and not args.overwrite and not args.resume:
