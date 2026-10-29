@@ -102,7 +102,7 @@ def identity(args):
     inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
     code = {name: digest(Path(__file__).with_name(name)) for name in
             ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
-             "discovery_compat.py", "null_identity.py", "glmm.py", "kinship.py")}
+             "discovery_compat.py", "discovery_eligibility.py", "null_identity.py", "glmm.py", "kinship.py")}
     from .null_identity import null_source_hash
     return dict(version=__version__, inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
@@ -119,6 +119,8 @@ def schema(db):
     CREATE TABLE IF NOT EXISTS reps(node INTEGER,pid INTEGER,PRIMARY KEY(node,pid)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tasks(a INTEGER,b INTEGER,done INTEGER DEFAULT 0,PRIMARY KEY(a,b)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS pending_tasks ON tasks(done,a,b);
+    CREATE TABLE IF NOT EXISTS block_eligibility(node INTEGER,min_cell INTEGER,center INTEGER,
+      radius INTEGER,eligible_members INTEGER,PRIMARY KEY(node,min_cell)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS decisions(u INTEGER,v INTEGER,gate INTEGER,final INTEGER,
       t_low REAL,t_high REAL,p REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS discovery_hits ON decisions(final,u,v);
@@ -340,15 +342,23 @@ def search(db, info, pool, args):
     buffer_limit=plan.get('query_buffer_pairs',8192)
     frontier=plan.get('frontier_tasks',max(128,args.threads*64))
     nodes=NodeCache(db,min(64*MIB,max(MIB,int(args.memory_gb*(1<<30)*.03))))
+    eligibility=None
+    if args.search=='hierarchy' and getattr(args,'min_cell_count',0)>0:
+        from .discovery_eligibility import Eligibility
+        eligibility=Eligibility(db,pool,args,info)
     def progress():
         nonlocal last
         if time.monotonic()-last<25:
             return
         count=get_meta(db,'queried_pairs_count',0)
         runtime=get_meta(db,'runtime_totals',{})
+        hierarchy=get_meta(db,'hierarchy_metrics',{})
         print(f"[KOVAR] search: {count:,} queried pattern pairs; {time.monotonic()-started:.0f}s this invocation; "
               f"new_nulls={runtime.get('new_null_fits',0):,}; cache_hits={runtime.get('null_cache_hits',0):,}; "
-              f"disk_loads={runtime.get('null_cache_disk_loads',0):,}",flush=True)
+              f"disk_loads={runtime.get('null_cache_disk_loads',0):,}; "
+              f"ineligible_blocks={hierarchy.get('eligibility_pruned_internal_blocks',0)+hierarchy.get('eligibility_pruned_cross_blocks',0):,}; "
+              f"proxy_pruned_blocks={hierarchy.get('representative_pruned_blocks',0):,}; "
+              f"bounded_pairs={runtime.get('bound_decided_pairs',0):,}; exact_pairs={runtime.get('exact_pairs',0):,}",flush=True)
         last=time.monotonic()
     if args.search=='exhaustive':
         response,offset=get_meta(db,'exhaustive_cursor',[1,0])
@@ -373,28 +383,37 @@ def search(db, info, pool, args):
                 set_meta(db,'search_initialized',True)
         roots=[row[0] for row in db.execute('SELECT id FROM nodes WHERE parent=0 ORDER BY id')]
         while True:
-            tasks=db.execute('SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT ?',(frontier,)).fetchall()
-            if not tasks:
-                i,j=get_meta(db,'root_cursor')
-                tasks=[]
-                while i<len(roots)-1 and len(tasks)<frontier:
-                    tasks.append((roots[i],roots[j]))
-                    j+=1
-                    if j==len(roots):
-                        i,j=i+1,i+2
-                if not tasks:
-                    break
+            # Reserve at least 3/4 of each frontier for queued refinements and
+            # at most 1/4 for fresh coarse comparisons. Neither waits for the
+            # other queue to finish. Scheduling/cursor updates are atomic.
+            quota=max(1,frontier//4)
+            tasks=db.execute('SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT ?',
+                             (max(1,frontier-quota),)).fetchall()
+            i,j=get_meta(db,'root_cursor')
+            fresh=[]
+            while i<len(roots)-1 and len(fresh)<frontier-len(tasks):
+                fresh.append((roots[i],roots[j]))
+                j+=1
+                if j==len(roots):
+                    i,j=i+1,i+2
+            if fresh:
                 with db:
-                    db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',tasks)
+                    db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',fresh)
                     set_meta(db,'root_cursor',[i,j])
+                tasks.extend(fresh)
+            if not tasks:
+                break
+            summaries=eligibility.summaries(tasks) if eligibility else {}
+            pruned={(a,b) for a,b in tasks if eligibility and eligibility.impossible(a,b,summaries)}
             def gate_pairs():
                 for a,b in tasks:
-                    if a!=b:
+                    if a!=b and (a,b) not in pruned:
                         yield from itertools.product(nodes.get(a)[2],nodes.get(b)[2])
             gates={}
             for block in batches(gate_pairs(),buffer_limit):
                 gates.update(evaluate(db,block,pool,args,screening=True,return_mapping=True))
             leaf_queries,leaf_done,transitions=[],[],[]
+            metrics={}
             def finish_leaves():
                 if leaf_queries:
                     evaluate(db,leaf_queries,pool,args)
@@ -404,9 +423,16 @@ def search(db, info, pool, args):
                 leaf_queries.clear()
                 leaf_done.clear()
             for a,b in tasks:
+                if (a,b) in pruned:
+                    key='eligibility_pruned_internal_blocks' if a==b else 'eligibility_pruned_cross_blocks'
+                    metrics[key]=metrics.get(key,0)+1
+                    transitions.append((a,b,()))
+                    continue
                 sa,ca,ra,ma=nodes.get(a)
                 sb,cb,rb,mb=nodes.get(b)
                 expand=a==b or any(gates[tuple(sorted(pair))][0]!=-1 for pair in itertools.product(ra,rb))
+                if not expand:
+                    metrics['representative_pruned_blocks']=metrics.get('representative_pruned_blocks',0)+1
                 children=()
                 if expand and not ca and not cb:
                     # Coalesce terminal work across blocks before scheduling it
@@ -437,6 +463,9 @@ def search(db, info, pool, args):
                 for a,b,children in transitions:
                     db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',(tuple(sorted(pair)) for pair in children))
                     db.execute('UPDATE tasks SET done=1 WHERE a=? AND b=?',(a,b))
+                saved=get_meta(db,'hierarchy_metrics',{})
+                merge_metrics(saved,metrics)
+                set_meta(db,'hierarchy_metrics',saved)
             progress()
     with db:
         set_meta(db,'search_complete',True)
@@ -680,6 +709,8 @@ def export(db, info, work, args, total_seconds):
                    saved_local_null_fit_seconds=null_seconds,
                    available_imported_nulls=db.execute("SELECT count(*) FROM external_nulls").fetchone()[0])
     summary['runtime_totals']=get_meta(db,'runtime_totals',{})
+    summary['hierarchy_metrics']=get_meta(db,'hierarchy_metrics',{})
+    summary['block_eligibility_pruning']='necessary marginal counts and anchor-radius Hamming bounds; categories retained'
     summary['memory_budget']=getattr(args,'_memory_info',None)
     summary['execution_plan']=getattr(args,'_plan',None)
     atomic_json(args.out/"run_summary.json",summary)
@@ -718,7 +749,7 @@ def main(argv=None):
                 raise ValueError("Existing work requires --resume")
             from .discovery_compat import migrate_identity
             if migrate_identity(json.loads(manifest.read_text()),expected,manifest):
-                print('[KOVAR] verified v0.9.0 checkpoint migrated; saved patterns, hierarchy, decisions and nulls retained',flush=True)
+                print('[KOVAR] verified released checkpoint migrated; saved patterns, hierarchy, decisions and nulls retained',flush=True)
         else:
             atomic_json(manifest,expected)
         atomic_json(args.out/"run_identity.json",dict(expected,work_directory=str(work)))

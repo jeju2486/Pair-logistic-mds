@@ -104,6 +104,17 @@ def bits(ids):
                          bitorder="little")[:, :_STATE["info"]["n"]]
 
 
+def eligibility_summary(job):
+    """Packed Hamming radius and necessary marginal eligibility; no null fit."""
+    node,center,ids,minimum = job
+    packed = _STATE['packed'][np.asarray(ids,dtype=int)]
+    radius = int(_POPCOUNT[np.bitwise_xor(packed,_STATE['packed'][center])].sum(axis=1).max())
+    counts = _POPCOUNT[packed].sum(axis=1)
+    n = _STATE['info']['n']
+    eligible = int(np.count_nonzero((counts>=2*minimum) & (counts<=n-2*minimum)))
+    return node,radius,eligible
+
+
 def similarity(job):
     """Bounded binary-phi comparisons; no dense all-pattern matrix."""
     representative, ids, threshold = job
@@ -326,6 +337,7 @@ def _score_chunk(job):
         lo, hi, p, statuses = adaptive_statistics(X, cache, cutoffs)
         metric("bounds_worker_seconds",max(0.,time.perf_counter()-started-(s["metrics"].get("exact_worker_seconds",0.)-before)))
         metric("bound_pairs",len(predictors))
+        metric("bound_decided_pairs",sum(status=='BOUNDED' for status in statuses))
     def decision(low, high, cutoff):
         return 1 if low >= cutoff else -1 if high < cutoff else 0
     return [(int(u), response, decision(l, h, gate), decision(l, h, final) if ok else -2,

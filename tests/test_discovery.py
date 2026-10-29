@@ -88,6 +88,15 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
             self.assertTrue((work/'run_identity.v090.json').exists())
             self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
+            # The execution-only v0.9.1 migration also keeps every saved model.
+            from ko_variation.discovery_compat import V091_CODE
+            legacy=json.loads((work/'run_identity.json').read_text())
+            legacy['version']='0.9.1'
+            legacy['code']={key:sorted(values)[0] for key,values in V091_CODE.items()}
+            atomic_json(work/'run_identity.json',legacy)
+            self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
+            self.assertTrue((work/'run_identity.v091.json').exists())
+            self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
             exact_out = folder/"exact"
             self.assertEqual(main(common+["--out",str(exact_out),"--search","exhaustive","--exact",
                                           "--reuse-nulls-from",str(out),"--require-cached-nulls"]),0)
@@ -130,6 +139,8 @@ class DiscoveryTests(unittest.TestCase):
             self.assertGreater(hdb.execute("SELECT count(*) FROM decisions").fetchone()[0],0,
                                str(hdb.execute("SELECT * FROM nodes").fetchall()))
             lookup={(u,v):state for u,v,state in bounded}
+            self.assertEqual(set(hdb.execute('SELECT u,v FROM decisions WHERE final=1')),
+                             {(u,v) for u,v,state in bounded if state==1})
             for u,v,state in hdb.execute("SELECT u,v,final FROM decisions"):
                 self.assertEqual(state,lookup[u,v])
             hdb.close()

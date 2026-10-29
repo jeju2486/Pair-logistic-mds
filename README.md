@@ -6,13 +6,15 @@ sample covariance, a binary logistic mixed-model null fit, and a score test.
 The output is evidence against no adjusted association; it is not an effect
 size, a causal direction, or proof of biological epistasis.
 
-Version 0.9.1 provides direct unitig discovery without SpydrPick, disk-backed
+Version 0.9.2 provides direct unitig discovery without SpydrPick, disk-backed
 hierarchical search, adaptive significance bounds and persistent null reuse.
 It retains significant local pairs and estimates beta only for confirmed distal
 pairs. See the [v0.9 discovery guide](docs/discovery.md) for inputs, CPU/memory
 controls, restart, and the heuristic limits of representative pruning.
 The performance update adds allocation-aware memory/cache budgets, response
-affinity, bulk database operations and verified v0.9.0 checkpoint migration.
+affinity, bulk database operations and verified v0.9.0/v0.9.1 checkpoint migration.
+Necessary joint-cell bounds skip ineligible hierarchy blocks while preserving
+their external associations. Coarse comparisons and queued refinements interleave.
 
 The legacy candidate-table scanner reports one result for each unordered pair. The separate
 `ko-variation-annotation` helper selects distal significant signals, calculates
@@ -22,7 +24,7 @@ See [downstream usage and interpretation](docs/downstream.md).
 ## Installation
 
 ```bash
-git clone --branch v0.9.1 https://github.com/jeju2486/Pair-logistic-mds.git
+git clone --branch v0.9.2 https://github.com/jeju2486/Pair-logistic-mds.git
 cd Pair-logistic-mds
 pip install -e .
 ko-variation --version
@@ -241,6 +243,16 @@ See `docs/model.md`, `docs/interpretation.md`, and `docs/research_basis.md` for
 more detail.
 
 ## Version history
+
+### 0.9.2
+
+- prune final-ineligible hierarchy blocks using necessary marginal counts and
+  actual anchor-radius Hamming bounds, before representative null fitting;
+- retain all categories and members for possible external associations;
+- interleave new coarse comparisons with queued hierarchy refinements;
+- report proven block pruning separately from heuristic representative pruning
+  and adaptive/exact scoring;
+- resume verified v0.9.0/v0.9.1 work with the same hypotheses and thresholds.
 
 ### 0.9.1
 

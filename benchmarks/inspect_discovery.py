@@ -59,12 +59,13 @@ def main():
     db.execute('PRAGMA query_only=ON')
     try:
         report['meta']={key:json.loads(value) for key,value in db.execute(
-            "SELECT key,value FROM meta WHERE key IN ('hierarchy_complete','search_initialized','root_cursor','search_complete','distance_expanded','runtime_totals','queried_pairs_count','memory_budget','resource_plan')")}
+            "SELECT key,value FROM meta WHERE key IN ('hierarchy_complete','search_initialized','root_cursor','search_complete','distance_expanded','runtime_totals','hierarchy_metrics','queried_pairs_count','memory_budget','resource_plan')")}
         roots=db.execute('SELECT count(*) FROM nodes WHERE parent=0').fetchone()[0]
         report['coarse_categories']=roots
         report['coarse_category_pairs']=roots*(roots-1)//2
         report['queried_pairs']=report['meta'].get('queried_pairs_count')
         report['runtime_totals']=report['meta'].pop('runtime_totals',{})
+        report['hierarchy_metrics']=report['meta'].pop('hierarchy_metrics',{})
         if args.detailed:
             report['queried_pairs']=db.execute('SELECT count(*) FROM decisions').fetchone()[0]
             report['pair_counts_by_final_state']=dict(db.execute('SELECT final,count(*) FROM decisions GROUP BY final'))

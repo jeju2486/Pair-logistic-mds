@@ -1,4 +1,4 @@
-# Unitig discovery in KOVAR 0.9.1
+# Unitig discovery in KOVAR 0.9.2
 
 `ko-variation discover` (also `ko-variation-discover`) accepts PAN-GWES unitig
 presence/absence directly. SpydrPick, MI and ARACNE are not required. The old
@@ -71,6 +71,30 @@ the recent benchmark target. This intentionally excludes sparse patterns/pairs;
 it is configurable and is not an intrinsic KOVAR requirement. It differs from
 the legacy scanner's default of 1. The score response is the higher pattern ID
 and the predictor the lower ID. IDs follow first occurrence by original locus.
+
+Before representative fitting, v0.9.2 checks whether a whole hierarchy task can
+contain a final-eligible pair. Every node has a saved anchor, its actual maximum
+Hamming distance to all members, and the number of members with at least 2c
+present and 2c absent observations, where c is the final minimum cell count.
+For two nodes, anchor distance d and radii r and s bound every member-pair
+Hamming distance between max(0,d-r-s) and min(n,d+r+s). Four cells >=c require
+2c <= Hamming distance <= n-2c. A block outside this interval is skipped;
+insufficient qualifying members also proves ineligibility. With c=0 this
+pruning is disabled. Packed-bit summary work uses the worker CPU budget,
+bounded batches and disk checkpoints; it fits no null models.
+
+This skips comparison tasks, **not nodes, members or external associations**.
+An internally ineligible category is still compared externally and can be
+refined against another category. These are proven eligibility exclusions
+under the specified cell rule; they do not establish biological independence.
+Representative pruning remains a separate heuristic. Neither pruning changes
+the Bonferroni family. Unqueried pairs are not assigned fabricated P-values.
+
+Queued refinements receive at least three quarters of a full scheduling
+frontier, while fresh coarse comparisons use up to one quarter when the queue
+is full. Spare frontier space also accepts coarse comparisons. External
+exploration therefore starts before all internal work finishes. Restart keeps
+the same saved traversal tasks and coarse cursor; unfinished tasks can repeat.
 
 Final significance is **Bonferroni adjusted P <=0.05**, not raw P <=0.05 or
 P <=0.001. The family is all unordered unique-pattern pairs before hierarchy,
@@ -169,13 +193,13 @@ adjusted on resume; they are execution settings.
 Changing scientific settings requires a new output. Distances/beta can be added
 later, but changed distance inputs/cutoffs cannot overwrite earlier results.
 
-### Resume an existing v0.9.0 run
+### Resume an existing v0.9.0 or v0.9.1 run
 
 Stop the running job **before updating its shared source checkout**. Then run
-v0.9.1 against the same OUT and original persistent work directory with `--resume`.
-The released v0.9.0 source hashes (LF/CRLF), inputs, scientific settings, null-fit
+v0.9.2 against the same OUT and original persistent work directory with `--resume`.
+The released v0.9.0/v0.9.1 source hashes (LF/CRLF), inputs, scientific settings, null-fit
 source and numerical environment are verified. A compatible manifest is backed
-up as `run_identity.v090.json`; saved patterns, hierarchy, decisions, queued tasks
+up as `run_identity.v090.json` or `run_identity.v091.json`; saved patterns, hierarchy, decisions, queued tasks
 and null models are retained. Unknown edited implementations or changed science
 are rejected. The score test, Bonferroni family/alpha, gate and joint-cell rules
 are unchanged. Execution order changes do not provide a new recovery guarantee.
@@ -226,6 +250,12 @@ batch's already-committed decisions without its final timing update. Legacy
 v0.9.0 work lacks these counters, so historical time cannot be reconstructed
 from the new counters alone. Progress prints query counts plus fit/cache counts;
 read-only inspection uses `benchmarks/inspect_discovery.py`.
+
+`hierarchy_metrics` separately counts proof-pruned internal/cross blocks and
+heuristically pruned representative blocks. Progress also prints bound-certified
+pair decisions and exact evaluations. Block counts and pair counts have
+different denominators. New counters cover work completed by this version;
+they cannot reconstruct historical pruning or certified-decision counts.
 
 An annotated distal map can use the existing network helper directly:
 

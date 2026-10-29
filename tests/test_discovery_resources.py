@@ -137,16 +137,21 @@ class ResourceTests(unittest.TestCase):
             args=SimpleNamespace(search='hierarchy',threads=2,batch_size=2,memory_gb=1,
                                  _plan=dict(frontier_tasks=4,query_buffer_pairs=3))
             calls=0
+            observed=[]
             def score(job):
                 nonlocal calls
                 calls+=1
                 if calls==2:
                     raise RuntimeError('interrupted worker')
                 response,predictors,_,_=job
+                observed.extend((u,response) for u in predictors)
                 return dict(rows=[(u,response,1,1,99.,99.,1e-20,'OK') for u in predictors],metrics={'jobs':1,'pairs':len(predictors)})
             with ThreadPoolExecutor(max_workers=2) as pool,patch('ko_variation.discovery_score.score_profiled',side_effect=score):
                 with self.assertRaisesRegex(RuntimeError,'interrupted'):
                     search(db,dict(patterns=8),pool,args)
+            # A coarse external comparison starts before the internal queue is
+            # exhausted; the old internal-first traversal scored (0,2) first.
+            self.assertEqual(observed[0],(0,4))
             calls=100
             with ThreadPoolExecutor(max_workers=2) as pool,patch('ko_variation.discovery_score.score_profiled',side_effect=score):
                 search(db,dict(patterns=8),pool,args)
