@@ -1,4 +1,4 @@
-# Unitig discovery in KOVAR 0.9.0
+# Unitig discovery in KOVAR 0.9.1
 
 `ko-variation discover` (also `ko-variation-discover`) accepts PAN-GWES unitig
 presence/absence directly. SpydrPick, MI and ARACNE are not required. The old
@@ -115,10 +115,35 @@ clipped weights and invalid variance remain explicit effect statuses.
 `--threads` is a total CPU budget. Independent numerical tasks run in process
 workers with one BLAS thread each; preparation's covariance decomposition and
 the external distance executable use the same CPU budget in separate phases.
-Parallel work submission is bounded, including on Python versions whose
-Executor.map would eagerly consume all jobs. Response-major batches prevent
-concurrent duplicate null fits within a frontier. Null RAM slots are limited
-by `--memory-gb`; this is an allocation estimate, not an OS-enforced RSS limit.
+Parallel work submission is bounded. A response is assigned consistently to
+one worker; completed score jobs are consumed without waiting for earlier,
+slower submissions. Terminal comparisons are coalesced across hierarchy blocks
+before response-wise batching. Numerical category reductions retain input order.
+
+Memory is adaptive in KOVAR itself. It reads Slurm per-node/per-CPU allocations,
+Linux cgroup v1/v2 limits (including parent limits), and physical memory, taking
+the smallest applicable constraint. The working target leaves 20% headroom.
+`--memory-gb` is an optional additional cap and cannot override a smaller detected
+allocation. Without a job limit or explicit cap, the fallback is conservatively
+4 GiB even on a large shared host. Slurm per-CPU memory uses the allocated CPU
+count, rather than assuming the requested worker count is the whole allocation.
+
+The planner reserves numerical working sets and coordinator/queue space before
+assigning at most 60% of the working target to null caches. Cache entries are
+charged by array bytes plus overhead, not a fixed model count. Each worker
+evicts least-recently-used saved nulls when its byte budget is reached. A process
+or cgroup working-set pressure check can reduce cache capacity; it grows back
+gradually when pressure falls. Inactive file cache is excluded where available.
+An active response stays reusable for the current scoring job even if the LRU
+budget is zero. The budget is an estimate, not an OS-enforced RSS limit; keep
+headroom for native workspaces, allocator behaviour and file cache.
+
+Saved arrays are checksummed on first worker access. Eviction/reload checks the
+file size, modification time and expected digest; changed files are rehashed.
+This retains integrity checks without repeatedly hashing unchanged models.
+Decision lookups use bounded bulk SQL, completed rows commit in blocks, and a
+byte-bounded node cache avoids repeated traversal metadata reads. No unbounded
+pair list or initial full category-pair graph is created.
 
 Pseudo-FASTA is decoded one sample at a time to a temporary mapped matrix.
 Locus blocks are packed/deduplicated through a disk index. Patterns and shared
@@ -139,10 +164,21 @@ Repeat the same command with `--resume`. Committed sample rows, deduplication
 blocks, category assignments, pair decisions, traversal batches, distance
 batches and beta fits are reused. An unfinished worker job may repeat.
 Input contents, fitting implementation, numerical environment and scientific
-settings are checked. CPU count, memory budget and batch size may be adjusted
-where they do not change scientific settings (currently batch size is frozen).
+settings are checked. CPU count, memory budget and numerical batch size may be
+adjusted on resume; they are execution settings.
 Changing scientific settings requires a new output. Distances/beta can be added
 later, but changed distance inputs/cutoffs cannot overwrite earlier results.
+
+### Resume an existing v0.9.0 run
+
+Stop the running job **before updating its shared source checkout**. Then run
+v0.9.1 against the same OUT and original persistent work directory with `--resume`.
+The released v0.9.0 source hashes (LF/CRLF), inputs, scientific settings, null-fit
+source and numerical environment are verified. A compatible manifest is backed
+up as `run_identity.v090.json`; saved patterns, hierarchy, decisions, queued tasks
+and null models are retained. Unknown edited implementations or changed science
+are rejected. The score test, Bonferroni family/alpha, gate and joint-cell rules
+are unchanged. Execution order changes do not provide a new recovery guarantee.
 
 ### Reuse existing nulls
 
@@ -170,7 +206,8 @@ new search implementation.
   orientation, optional exact P, labelled P bounds, minimum graph distance,
   connected-genome count, distance status and optional post-hoc beta.
 - `run_summary.json`: family/cutoff, sample exclusions, decision counts,
-  unqueried count, search interpretation, distance/effect statuses and runtime.
+  unqueried count, search interpretation, distance/effect statuses, resource
+  plan and runtime counters.
 - `run_identity.json`: provenance for restart and cache compatibility.
 
 No exact P is manufactured for a bound-certified edge. A small P remains genomic
@@ -178,6 +215,17 @@ association, not proof of a phenotype interaction, causality or mechanism.
 The work database retains queried nonsignificant/ineligible/unresolved decisions
 for restart, without exporting billions of unnecessary text rows. Final exports
 are streamed and atomically replaced; an interrupted export can be regenerated.
+
+During a run, `meta.runtime_totals` in `work.sqlite` records new null fits,
+RAM hits, disk loads, evictions, bound/exact pair counts, worker-time totals for
+fitting/loading/saving/bounds/exact scoring, and coordinator database timings.
+Worker times are summed across processes and are not wall-clock durations.
+Cache-load time includes hashing; do not add the hash subtotal again. Timing
+counters describe completed evaluation batches; interruption can leave a last
+batch's already-committed decisions without its final timing update. Legacy
+v0.9.0 work lacks these counters, so historical time cannot be reconstructed
+from the new counters alone. Progress prints query counts plus fit/cache counts;
+read-only inspection uses `benchmarks/inspect_discovery.py`.
 
 An annotated distal map can use the existing network helper directly:
 
@@ -200,6 +248,9 @@ it is separate from the memory-bounded all-pattern discovery scan.
 production paths on a supplied **small frozen pseudo-FASTA panel**. It reuses
 compatible fitted nulls and reports query counts, recovery and invocation time.
 The default cap is 2,000 original loci; it does not silently launch a full-pool
-exhaustive scan. Exact invocation time includes fitting; the next arms reuse
-models, so these are not independent cold-run timings. There are no full ARC
-runtime or whole-pool recovery guarantees in this release.
+exhaustive scan. `--screen-p` matches production by default and
+`--bonferroni-tests` can freeze the larger full-study hypothesis family for a
+sampled panel. The comparison table includes fitting/loading/bound/exact worker
+times and coordinator database times. Exact invocation time includes fitting;
+the next arms reuse models, so these are not independent cold-run timings.
+There are no full ARC runtime or whole-pool recovery guarantees in this release.

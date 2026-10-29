@@ -16,7 +16,7 @@ class CommandLineContractTests(unittest.TestCase):
     def test_version(self) -> None:
         completed = self._run("--version")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "KO-Variation 0.9.0")
+        self.assertEqual(completed.stdout.strip(), "KO-Variation 0.9.1")
 
     def test_help_exposes_small_primary_interface(self) -> None:
         completed = self._run("--help")

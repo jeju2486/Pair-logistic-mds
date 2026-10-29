@@ -17,6 +17,7 @@ from threadpoolctl import threadpool_limits
 from .discovery_store import atomic_json, digest, open_patterns
 from .glmm import (KinshipEigensystem, _WeightedEigen, fit_logistic_mixed,
                    fit_null_glmm, score_predictor_block)
+from .memory_budget import ByteLRU, working_usage, process_rss, MIB
 
 _STATE = {}
 _POPCOUNT = np.array([int(i).bit_count() for i in range(256)], dtype="u1")
@@ -27,11 +28,75 @@ def initialize(work, info, settings):
     threadpool_limits(limits=1)
     work = Path(work)
     _STATE.clear()
+    cache_limit=settings.get("cache_bytes_per_worker",0)
     _STATE.update(work=work, info=info, settings=settings,
-                  packed=open_patterns(work, info), nulls=OrderedDict(),last_log=0.,
+                  packed=open_patterns(work, info), nulls=ByteLRU(cache_limit),
+                  cache_limit=cache_limit,last_pressure=0.,verified=OrderedDict(),metrics={},last_log=0.,
                   K=np.load(work/"K.npy", mmap_mode="r"),
                   eigen=KinshipEigensystem(np.load(work/"K_values.npy", mmap_mode="r"),
                       np.load(work/"K_vectors.npy", mmap_mode="r"), info["shared_covariance"]))
+
+
+def metric(key,value=1):
+    values=_STATE.get("metrics")
+    if values is not None:
+        values[key]=values.get(key,0)+value
+
+
+def pressure_guard():
+    s=_STATE
+    now=time.monotonic()
+    if now-s["last_pressure"]<1:
+        return
+    s["last_pressure"]=now
+    settings=s["settings"]
+    usage=working_usage(settings.get("monitor"))
+    target=settings.get("total_working_bytes")
+    if usage is None:
+        usage=process_rss()
+        target=settings.get("worker_target_bytes")
+    if usage is None or not target:
+        return
+    cache=s["nulls"]
+    if usage>=target:
+        cache.trim(int(cache.limit*.75))
+        metric("memory_pressure_events")
+    elif usage<target*.85 and cache.limit<s["cache_limit"]:
+        cache.limit=min(s["cache_limit"],cache.limit+max(16*MIB,int(.1*s["cache_limit"])))
+
+
+def cache_charge(cache):
+    if cache is None:
+        return 1024
+    seen=set()
+    size=4096
+    arrays=[v for k,v in cache.items() if k!="K" and isinstance(v,np.ndarray)]
+    arrays.extend(v for v in vars(cache["decomp"]).values() if isinstance(v,np.ndarray))
+    for array in arrays:
+        key=(array.__array_interface__["data"][0],array.nbytes)
+        if key not in seen:
+            seen.add(key)
+            size+=array.nbytes
+    return size
+
+
+def verify_product(product,expected):
+    # Rehash only when the immutable file's size/mtime or expected digest changed.
+    # Validation is never skipped on a worker's first access to a saved model.
+    stamp=product.stat()
+    signature=(stamp.st_size,stamp.st_mtime_ns,expected)
+    verified=_STATE["verified"]
+    key=str(product)
+    if verified.get(key)!=signature:
+        started=time.perf_counter()
+        if digest(product)!=expected:
+            raise ValueError(f"Corrupted null cache: {product}")
+        metric("cache_hash_worker_seconds",time.perf_counter()-started)
+        verified[key]=signature
+        # Small verification metadata has a separate bounded allowance.
+        while len(verified)*512>max(MIB,int(.01*_STATE["cache_limit"])):
+            verified.popitem(last=False)
+    verified.move_to_end(key)
 
 
 def bits(ids):
@@ -84,10 +149,17 @@ def central(job):
 
 def get_null(pattern, external=None):
     s = _STATE
+    pressure_guard()
+    if s.get('active_null') is not None and s['active_null'][0]==pattern:
+        metric('null_job_reuse_hits')
+        return s['active_null'][1]
     if pattern in s["nulls"]:
-        value = s["nulls"].pop(pattern)
-        s["nulls"][pattern] = value
+        metric("null_cache_hits")
+        value=s['nulls'].get(pattern)
+        if 'active_null' in s:
+            s['active_null']=(pattern,value)
         return value
+    load_started=time.perf_counter()
     folder = s["work"]/"null_models"/f"{pattern//1000:06d}"
     folder.mkdir(parents=True, exist_ok=True)
     meta = folder/f"null_{pattern:09d}.json"
@@ -95,12 +167,12 @@ def get_null(pattern, external=None):
     source = meta if meta.exists() else Path(external) if external else None
     y = bits([pattern])[0].astype(float)
     if source is not None:
+        metric("null_cache_disk_loads")
         record = json.loads(source.read_text())
         cache = None
         if record["array"] is not None:
             product = source.parent/record["array"]["name"]
-            if digest(product) != record["array"]["sha256"]:
-                raise ValueError(f"Corrupted null cache: {product}")
+            verify_product(product,record["array"]["sha256"])
             with np.load(product, allow_pickle=False) as saved:
                 cache = {key: saved[key] for key in ("y", "mu", "weights", "C", "Sinv_C", "M_inv")}
                 cache["tau"] = float(saved["tau"])
@@ -108,8 +180,10 @@ def get_null(pattern, external=None):
                     saved["eigenvectors"], float(saved["logdet_w_inverse"]))
             if not np.array_equal(cache["y"], y):
                 raise ValueError("Cached null response differs")
+            verify_product(product,record["array"]["sha256"])
         if record["status"] == "OK" and cache is None:
             raise ValueError("Successful null cache has no arrays")
+        metric("cache_load_worker_seconds",time.perf_counter()-load_started)
     else:
         if s["settings"]["require_cached_nulls"]:
             raise ValueError(f"No cached null for pattern {pattern}")
@@ -118,8 +192,11 @@ def get_null(pattern, external=None):
             print(f"[KOVAR worker {os.getpid()}] fitting response pattern {pattern}",flush=True)
             s["last_log"]=started
         fit, cache = fit_null_glmm(pattern, y, s["K"], kinship_eigensystem=s["eigen"])
+        metric("new_null_fits")
+        metric("null_fit_worker_seconds",time.monotonic()-started)
         record = dict(pattern=pattern, status=fit.status,
                       fit_seconds=time.monotonic()-started, array=None)
+        save_started=time.perf_counter()
         if fit.status == "OK" and cache:
             decomp = cache["decomp"]
             order = np.argsort(decomp.eigenvalues)[::-1]
@@ -137,10 +214,13 @@ def get_null(pattern, external=None):
         else:
             cache = None
         atomic_json(meta, record)
+        metric("cache_save_worker_seconds",time.perf_counter()-save_started)
+    if cache is not None:
+        cache["_inverse_spectrum"]=1/(1+cache["tau"]*cache["decomp"].eigenvalues)
     value = (cache, record["status"])
-    s["nulls"][pattern] = value
-    while len(s["nulls"]) > s["settings"]["ram_nulls"]:
-        s["nulls"].popitem(last=False)
+    s["nulls"].put(pattern,value,cache_charge(cache))
+    if 'active_null' in s:
+        s['active_null']=(pattern,value)
     return value
 
 
@@ -154,7 +234,9 @@ def adaptive_statistics(X, cache, criticals, ranks=(0, 8, 16, 32, 64, 128)):
     A = decomp.sqrt_w[:, None]*(X-C @ (cache["M_inv"] @ (cache["Sinv_C"].T @ X)))
     energy = np.sum(A*A, axis=0)
     U = X.T @ (cache["y"]-cache["mu"])
-    d = 1/(1+cache["tau"]*decomp.eigenvalues)
+    d = cache.get("_inverse_spectrum")
+    if d is None:
+        d = 1/(1+cache["tau"]*decomp.eigenvalues)
     if not np.all(np.isfinite(d)) or np.any(d <= 0):
         raise ValueError("Invalid inverse covariance spectrum")
     width = len(U)
@@ -194,11 +276,14 @@ def adaptive_statistics(X, cache, criticals, ranks=(0, 8, 16, 32, 64, 128)):
     statuses = ["BOUNDED"]*width
     pending = np.flatnonzero(active)
     if len(pending):
+        started=time.perf_counter()
         for index, result in zip(pending, score_predictor_block(X[:, pending], cache, compute_spa_adjustment=False)):
             statuses[index] = result.status
             if result.status == "OK" and np.isfinite(result.score_z):
                 lo[index] = hi[index] = result.score_z**2
                 exact_p[index] = float(result.p_score)
+        metric("exact_worker_seconds",time.perf_counter()-started)
+        metric("exact_pairs",len(pending))
     return lo, hi, exact_p, statuses
 
 
@@ -226,14 +311,21 @@ def _score_chunk(job):
     # Ineligible pairs route the hierarchy, but can never become discoveries.
     cutoffs = [gate, np.where(eligible, final, gate)]
     if s["settings"]["exact"]:
+        started=time.perf_counter()
         lo, hi, p, statuses = np.zeros(len(predictors)), np.full(len(predictors), np.inf), [], []
         for i, result in enumerate(score_predictor_block(X, cache, compute_spa_adjustment=False)):
             statuses.append(result.status)
             p.append(float(result.p_score) if result.status == "OK" else None)
             if result.status == "OK":
                 lo[i] = hi[i] = result.score_z**2
+        metric("exact_worker_seconds",time.perf_counter()-started)
+        metric("exact_pairs",len(predictors))
     else:
+        started=time.perf_counter()
+        before=s["metrics"].get("exact_worker_seconds",0.)
         lo, hi, p, statuses = adaptive_statistics(X, cache, cutoffs)
+        metric("bounds_worker_seconds",max(0.,time.perf_counter()-started-(s["metrics"].get("exact_worker_seconds",0.)-before)))
+        metric("bound_pairs",len(predictors))
     def decision(low, high, cutoff):
         return 1 if low >= cutoff else -1 if high < cutoff else 0
     return [(int(u), response, decision(l, h, gate), decision(l, h, final) if ok else -2,
@@ -245,9 +337,26 @@ def score(job):
     response, predictors, external, screening = job
     width = _STATE["settings"]["batch_size"]
     result = []
-    for start in range(0,len(predictors),width):
-        result.extend(_score_chunk((response,predictors[start:start+width],external,screening)))
+    _STATE['active_null']=None
+    try:
+        for start in range(0,len(predictors),width):
+            result.extend(_score_chunk((response,predictors[start:start+width],external,screening)))
+    finally:
+        _STATE.pop('active_null',None)
     return result
+
+
+def score_profiled(job):
+    started=time.perf_counter()
+    before=dict(_STATE.get("metrics",{}))
+    old_evictions=_STATE["nulls"].evictions if "nulls" in _STATE else 0
+    rows=score(job)
+    metrics={key:value-before.get(key,0) for key,value in _STATE.get("metrics",{}).items()}
+    metrics.update(worker_job_seconds=time.perf_counter()-started,jobs=1,pairs=len(rows))
+    if "nulls" in _STATE:
+        metrics["null_cache_evictions"]=_STATE["nulls"].evictions-old_evictions
+        metrics["cache_peak_bytes_worker"]=_STATE["nulls"].peak_bytes
+    return dict(rows=rows,metrics=metrics)
 
 
 def beta(job):

@@ -75,6 +75,9 @@ def records(path):
 
 
 def prepare(args, db, work):
+    if args.memory_gb is None:
+        from .memory_budget import detect_budget
+        args.memory_gb=detect_budget(None,args.threads)['working_gb']
     ready = work / "prepared.json"
     if ready.exists():
         info = json.loads(ready.read_text())

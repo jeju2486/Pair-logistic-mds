@@ -77,7 +77,16 @@ class DiscoveryTests(unittest.TestCase):
                 set_meta(db,"exhaustive_cursor",[1,0])
             db.close()
             kernels._STATE.clear()
+            # Exercise migration from the exact released v0.9.0 identity while
+            # preserving the completed pattern/model/decision products.
+            from ko_variation.discovery_compat import V090_CODE
+            legacy=json.loads((work/"run_identity.json").read_text())
+            legacy['version']='0.9.0'
+            legacy['code']={key:sorted(values)[0] for key,values in V090_CODE.items()}
+            legacy['settings']['batch_size']=3
+            atomic_json(work/'run_identity.json',legacy)
             self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
+            self.assertTrue((work/'run_identity.v090.json').exists())
             self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
             exact_out = folder/"exact"
             self.assertEqual(main(common+["--out",str(exact_out),"--search","exhaustive","--exact",

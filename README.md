@@ -6,11 +6,13 @@ sample covariance, a binary logistic mixed-model null fit, and a score test.
 The output is evidence against no adjusted association; it is not an effect
 size, a causal direction, or proof of biological epistasis.
 
-Version 0.9.0 adds direct unitig discovery without SpydrPick, disk-backed
+Version 0.9.1 provides direct unitig discovery without SpydrPick, disk-backed
 hierarchical search, adaptive significance bounds and persistent null reuse.
 It retains significant local pairs and estimates beta only for confirmed distal
 pairs. See the [v0.9 discovery guide](docs/discovery.md) for inputs, CPU/memory
 controls, restart, and the heuristic limits of representative pruning.
+The performance update adds allocation-aware memory/cache budgets, response
+affinity, bulk database operations and verified v0.9.0 checkpoint migration.
 
 The legacy candidate-table scanner reports one result for each unordered pair. The separate
 `ko-variation-annotation` helper selects distal significant signals, calculates
@@ -20,7 +22,7 @@ See [downstream usage and interpretation](docs/downstream.md).
 ## Installation
 
 ```bash
-git clone --branch v0.9.0 https://github.com/jeju2486/Pair-logistic-mds.git
+git clone --branch v0.9.1 https://github.com/jeju2486/Pair-logistic-mds.git
 cd Pair-logistic-mds
 pip install -e .
 ko-variation --version
@@ -239,6 +241,15 @@ See `docs/model.md`, `docs/interpretation.md`, and `docs/research_basis.md` for
 more detail.
 
 ## Version history
+
+### 0.9.1
+
+- adapt memory targets to scheduler/cgroup/host limits, with an optional cap;
+- replace fixed-count model caches with byte-limited LRU caches and pressure checks;
+- pin responses to workers, coalesce leaf work, and consume completed score jobs promptly;
+- bulk-read decisions, batch durable writes, and cache traversal metadata;
+- retain verified v0.9.0 checkpoints and fitted models without changing the test;
+- report fitting, cache, numerical-kernel and coordinator timings separately.
 
 ### 0.9.0
 

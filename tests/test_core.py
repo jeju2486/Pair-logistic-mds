@@ -7,7 +7,7 @@ from ko_variation import __version__
 
 class PackageMetadataTests(unittest.TestCase):
     def test_version(self) -> None:
-        self.assertEqual(__version__, "0.9.0")
+        self.assertEqual(__version__, "0.9.1")
 
 
 if __name__ == "__main__":

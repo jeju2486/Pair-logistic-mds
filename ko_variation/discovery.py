@@ -7,11 +7,9 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
 import itertools
 import json
 import math
-import multiprocessing
 from pathlib import Path
 import shutil
 import sqlite3
@@ -27,6 +25,8 @@ from threadpoolctl import threadpool_limits
 from . import __version__
 from . import discovery_score as kernels
 from .discovery_store import atomic_json, connect, digest, prepare, write_gzip
+from .discovery_execution import ResponsePool, bounded_map
+from .memory_budget import ByteLRU, detect_budget, plan_workers, MIB
 
 
 def batches(values, size):
@@ -36,21 +36,6 @@ def batches(values, size):
         if not batch:
             break
         yield batch
-
-
-def bounded_map(pool, function, jobs, threads):
-    """Executor.map eagerly consumes iterators on Python <=3.13; do not use it."""
-    pending, source = deque(), iter(jobs)
-    for _ in range(max(1, threads*2)):
-        job = next(source, None)
-        if job is None:
-            break
-        pending.append(pool.submit(function, job))
-    while pending:
-        yield pending.popleft().result()
-        job = next(source, None)
-        if job is not None:
-            pending.append(pool.submit(function, job))
 
 
 def parser():
@@ -78,7 +63,7 @@ def parser():
     p.add_argument("--rep-policy", choices=["single", "coverage"], default="single")
     p.add_argument("--max-reps", type=int, default=10)
     p.add_argument("--threads", type=int, default=1, help="Total CPU budget; process workers use one BLAS thread each")
-    p.add_argument("--memory-gb", type=float, default=4, help="Conservative working-memory budget; OS file cache excluded")
+    p.add_argument("--memory-gb", type=float, default=None, help="Optional GiB cap; auto-detect job allocation with headroom, otherwise conservative 4 GiB")
     p.add_argument("--tmp-dir", type=Path, help="Persistent work directory on scratch; must survive restart")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--distance-batch-size", type=int, default=5000)
@@ -95,7 +80,7 @@ def validate(args):
     for name in ("threads", "batch_size", "distance_batch_size", "leaf_size", "max_reps", "kmer_length"):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_','-')} must be positive")
-    if not np.isfinite(args.memory_gb) or args.memory_gb < .25:
+    if args.memory_gb is not None and (not np.isfinite(args.memory_gb) or args.memory_gb < .25):
         raise ValueError("--memory-gb must be finite and >=0.25")
     if not 0 <= args.min_maf <= .5 or args.min_cell_count < 0 or args.distal_bp < 0:
         raise ValueError("Invalid frequency/cell-count/distance threshold")
@@ -111,11 +96,13 @@ def validate(args):
 def identity(args):
     # Execution resources can change on resume; statistical settings cannot.
     omitted = {"threads", "memory_gb", "out", "tmp_dir", "resume", "reuse_nulls_from", "require_cached_nulls",
-               "unitig_distance", "unitigs", "paths", "edges", "kmer_length", "distal_bp", "no_beta", "distance_batch_size"}
-    settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items() if k not in omitted}
+               "unitig_distance", "unitigs", "paths", "edges", "kmer_length", "distal_bp", "no_beta", "distance_batch_size", "batch_size"}
+    settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()
+                if k not in omitted and not k.startswith('_')}
     inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
     code = {name: digest(Path(__file__).with_name(name)) for name in
-            ("discovery.py", "discovery_store.py", "discovery_score.py", "null_identity.py", "glmm.py", "kinship.py")}
+            ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
+             "discovery_compat.py", "null_identity.py", "glmm.py", "kinship.py")}
     from .null_identity import null_source_hash
     return dict(version=__version__, inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
@@ -263,105 +250,196 @@ def make_hierarchy(db, info, pool, args):
         set_meta(db, "hierarchy_complete", True)
 
 
-def evaluate(db, pairs, pool, args, screening=False):
-    # The caller supplies at most one task block, never the entire pair pool.
-    requested = sorted({tuple(sorted((int(u), int(v)))) for u, v in pairs if u != v}, key=lambda pair:(pair[1],pair[0]))
-    missing=[]
-    for pair in requested:
-        row=db.execute("SELECT status FROM decisions WHERE u=? AND v=?",pair).fetchone()
-        if row is None or screening and row[0]=="INELIGIBLE_NOT_SCREENED":
-            missing.append(pair)
-    def jobs():
-        for response, group in itertools.groupby(missing, key=lambda pair:pair[1]):
-            external = db.execute("SELECT path FROM external_nulls WHERE pid=?", (response,)).fetchone()
-            # Exactly one active job per response, internally chunked by worker.
-            yield response, [pair[0] for pair in group], external[0] if external else None,screening
-    for result in bounded_map(pool, kernels.score, jobs(), args.threads):
+def merge_metrics(target, values):
+    for key,value in values.items():
+        target[key]=max(target.get(key,0),value) if key=="cache_peak_bytes_worker" else target.get(key,0)+value
+
+
+def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
+    """Bulk-read decisions, coalesce responses, and commit bounded result blocks."""
+    started=time.perf_counter()
+    requested=sorted({tuple(sorted((int(u),int(v)))) for u,v in pairs if u!=v},key=lambda pair:(pair[1],pair[0]))
+    if not requested:
+        return {} if return_mapping else []
+    known,missing,new_pairs={},[],set()
+    read_started=time.perf_counter()
+    for block in batches(requested,400):
+        values=','.join(['(?,?)']*len(block))
+        query=(f'WITH requested(u,v) AS (VALUES {values}) '
+               'SELECT r.u,r.v,d.gate,d.final,d.status FROM requested r '
+               'LEFT JOIN decisions d ON d.u=r.u AND d.v=r.v')
+        rows={(u,v):(gate,final,status) for u,v,gate,final,status in db.execute(query,[x for pair in block for x in pair])}
+        for pair in block:
+            gate,final,status=rows[pair]
+            if status is None or screening and status=="INELIGIBLE_NOT_SCREENED":
+                missing.append(pair)
+                if status is None:
+                    new_pairs.add(pair)
+            else:
+                known[pair]=(gate,final)
+    external={}
+    responses=sorted({v for _,v in missing})
+    for block in batches(responses,400):
+        marks=','.join('?' for _ in block)
+        external.update(db.execute(f'SELECT pid,path FROM external_nulls WHERE pid IN ({marks})',block))
+    totals=dict(driver_db_read_seconds=time.perf_counter()-read_started)
+    pending=[]
+    def flush():
+        if not pending:
+            return
+        write_started=time.perf_counter()
         with db:
-            db.executemany("INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?)", result)
-    return [db.execute("SELECT gate,final FROM decisions WHERE u=? AND v=?", pair).fetchone() for pair in requested]
+            count=get_meta(db,"queried_pairs_count")
+            if count is None:
+                count=db.execute('SELECT count(*) FROM decisions').fetchone()[0]
+            db.executemany('INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?)',pending)
+            count+=sum((row[0],row[1]) in new_pairs for row in pending)
+            set_meta(db,"queried_pairs_count",count)
+        pending.clear()
+        merge_metrics(totals,dict(driver_db_write_seconds=time.perf_counter()-write_started))
+    def jobs():
+        for response,group in itertools.groupby(missing,key=lambda pair:pair[1]):
+            yield response,[pair[0] for pair in group],external.get(response),screening
+    for payload in bounded_map(pool,kernels.score_profiled,jobs(),args.threads,ordered=False):
+        result=payload['rows']
+        merge_metrics(totals,payload['metrics'])
+        pending.extend(result)
+        known.update(((row[0],row[1]),(row[2],row[3])) for row in result)
+        if len(pending)>=4096:
+            flush()
+    flush()
+    merge_metrics(totals,dict(coordinator_batch_wall_seconds=time.perf_counter()-started))
+    with db:
+        saved=get_meta(db,'runtime_totals',{})
+        merge_metrics(saved,totals)
+        set_meta(db,'runtime_totals',saved)
+    return known if return_mapping else [known[pair] for pair in requested]
+
+
+class NodeCache:
+    def __init__(self,db,limit):
+        self.db,self.cache=db,ByteLRU(limit)
+
+    def get(self,node):
+        if node in self.cache:
+            return self.cache.get(node)
+        size=self.db.execute('SELECT size FROM nodes WHERE id=?',(node,)).fetchone()[0]
+        children=tuple(r[0] for r in self.db.execute('SELECT id FROM nodes WHERE parent=? ORDER BY id',(node,)))
+        reps=tuple(r[0] for r in self.db.execute('SELECT pid FROM reps WHERE node=? ORDER BY pid',(node,)))
+        members=() if children else tuple(r[0] for r in self.db.execute('SELECT pid FROM members WHERE node=? ORDER BY pid',(node,)))
+        value=(size,children,reps,members)
+        self.cache.put(node,value,256+40*(len(children)+len(reps)+len(members)))
+        return value
 
 
 def search(db, info, pool, args):
-    if get_meta(db, "search_complete"):
+    if get_meta(db,'search_complete'):
         return
-    started, last = time.monotonic(), 0.
-    if args.search == "exhaustive":
-        response, offset = get_meta(db, "exhaustive_cursor", [1,0])
-        while response < info["patterns"]:
-            for first in range(offset, response, args.batch_size):
-                evaluate(db, ((u,response) for u in range(first,min(response,first+args.batch_size))), pool, args)
-                with db:
-                    set_meta(db, "exhaustive_cursor", [response, min(response,first+args.batch_size)])
-            response, offset = response+1, 0
-            if time.monotonic()-last > 25:
-                print(f"[KOVAR] exhaustive: {response:,}/{info['patterns']:,} responses", flush=True)
-                last = time.monotonic()
-    else:
-        if not get_meta(db, "search_initialized"):
+    started,last=time.monotonic(),0.
+    plan=getattr(args,'_plan',{})
+    buffer_limit=plan.get('query_buffer_pairs',8192)
+    frontier=plan.get('frontier_tasks',max(128,args.threads*64))
+    nodes=NodeCache(db,min(64*MIB,max(MIB,int(args.memory_gb*(1<<30)*.03))))
+    def progress():
+        nonlocal last
+        if time.monotonic()-last<25:
+            return
+        count=get_meta(db,'queried_pairs_count',0)
+        runtime=get_meta(db,'runtime_totals',{})
+        print(f"[KOVAR] search: {count:,} queried pattern pairs; {time.monotonic()-started:.0f}s this invocation; "
+              f"new_nulls={runtime.get('new_null_fits',0):,}; cache_hits={runtime.get('null_cache_hits',0):,}; "
+              f"disk_loads={runtime.get('null_cache_disk_loads',0):,}",flush=True)
+        last=time.monotonic()
+    if args.search=='exhaustive':
+        response,offset=get_meta(db,'exhaustive_cursor',[1,0])
+        while response<info['patterns']:
+            query=[]
+            while response<info['patterns'] and len(query)<buffer_limit:
+                stop=min(response,offset+buffer_limit-len(query))
+                query.extend((u,response) for u in range(offset,stop))
+                offset=stop
+                if offset>=response:
+                    response,offset=response+1,0
+            evaluate(db,query,pool,args)
             with db:
-                db.execute("INSERT OR IGNORE INTO tasks SELECT id,id,0 FROM nodes WHERE parent=0")
-                set_meta(db, "root_cursor", [0,1])
-                set_meta(db, "search_initialized", True)
-        # Only root IDs, O(categories), are kept in RAM; root-pair lists are not.
-        roots = [r[0] for r in db.execute("SELECT id FROM nodes WHERE parent=0 ORDER BY id")]
+                set_meta(db,'exhaustive_cursor',[response,offset])
+            progress()
+    else:
+        if not get_meta(db,'search_initialized'):
+            with db:
+                # Singleton internal blocks contain no pair to test.
+                db.execute('INSERT OR IGNORE INTO tasks SELECT id,id,0 FROM nodes WHERE parent=0 AND size>1')
+                set_meta(db,'root_cursor',[0,1])
+                set_meta(db,'search_initialized',True)
+        roots=[row[0] for row in db.execute('SELECT id FROM nodes WHERE parent=0 ORDER BY id')]
         while True:
-            tasks = db.execute("SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT 128").fetchall()
+            tasks=db.execute('SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT ?',(frontier,)).fetchall()
             if not tasks:
-                i,j = get_meta(db, "root_cursor")
-                new = []
-                while i < len(roots)-1 and len(new) < 128:
-                    new.append((roots[i], roots[j]))
-                    j += 1
-                    if j == len(roots):
-                        i,j = i+1,i+2
-                if not new:
+                i,j=get_meta(db,'root_cursor')
+                tasks=[]
+                while i<len(roots)-1 and len(tasks)<frontier:
+                    tasks.append((roots[i],roots[j]))
+                    j+=1
+                    if j==len(roots):
+                        i,j=i+1,i+2
+                if not tasks:
                     break
                 with db:
-                    db.executemany("INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)", new)
-                    set_meta(db, "root_cursor", [i,j])
-                tasks = new
-            # Route a bounded frontier together to improve response/null reuse.
-            gates = []
+                    db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',tasks)
+                    set_meta(db,'root_cursor',[i,j])
+            def gate_pairs():
+                for a,b in tasks:
+                    if a!=b:
+                        yield from itertools.product(nodes.get(a)[2],nodes.get(b)[2])
+            gates={}
+            for block in batches(gate_pairs(),buffer_limit):
+                gates.update(evaluate(db,block,pool,args,screening=True,return_mapping=True))
+            leaf_queries,leaf_done,transitions=[],[],[]
+            def finish_leaves():
+                if leaf_queries:
+                    evaluate(db,leaf_queries,pool,args)
+                if leaf_done:
+                    with db:
+                        db.executemany('UPDATE tasks SET done=1 WHERE a=? AND b=?',leaf_done)
+                leaf_queries.clear()
+                leaf_done.clear()
             for a,b in tasks:
-                if a != b:
-                    ra = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=?", (a,))]
-                    rb = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=?", (b,))]
-                    gates.extend(itertools.product(ra,rb))
-            evaluate(db, gates, pool, args,screening=True)
-            for a,b in tasks:
-                ca = [r[0] for r in db.execute("SELECT id FROM nodes WHERE parent=? ORDER BY id", (a,))]
-                cb = [r[0] for r in db.execute("SELECT id FROM nodes WHERE parent=? ORDER BY id", (b,))]
-                expand = True
-                if a != b:
-                    ra = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=?", (a,))]
-                    rb = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=?", (b,))]
-                    states = evaluate(db, itertools.product(ra,rb), pool, args,screening=True)
-                    expand = any(gate != -1 for gate,_ in states)
-                children = []
+                sa,ca,ra,ma=nodes.get(a)
+                sb,cb,rb,mb=nodes.get(b)
+                expand=a==b or any(gates[tuple(sorted(pair))][0]!=-1 for pair in itertools.product(ra,rb))
+                children=()
+                if expand and not ca and not cb:
+                    # Coalesce terminal work across blocks before scheduling it
+                    # by response. The buffer remains bounded independently of
+                    # the number of categories or total genomic pair count.
+                    pairs=itertools.combinations(ma,2) if a==b else itertools.product(ma,mb)
+                    for block in batches(pairs,buffer_limit):
+                        if len(leaf_queries)+len(block)>buffer_limit:
+                            finish_leaves()
+                        leaf_queries.extend(block)
+                        if len(leaf_queries)>=buffer_limit:
+                            evaluate(db,leaf_queries,pool,args)
+                            leaf_queries.clear()
+                    leaf_done.append((a,b))
+                    continue
                 if expand:
-                    if a == b and ca:
-                        children = itertools.combinations_with_replacement(ca,2)
-                    elif ca or cb:
-                        size_a = db.execute("SELECT size FROM nodes WHERE id=?", (a,)).fetchone()[0]
-                        size_b = db.execute("SELECT size FROM nodes WHERE id=?", (b,)).fetchone()[0]
-                        children = [(c,b) for c in ca] if ca and (not cb or size_a >= size_b) else [(a,c) for c in cb]
+                    if a==b:
+                        children=itertools.combinations_with_replacement(ca,2)
+                    elif ca and (not cb or sa>=sb):
+                        children=itertools.product(ca,(b,))
                     else:
-                        ma = [r[0] for r in db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid", (a,))]
-                        mb = ma if a == b else [r[0] for r in db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid", (b,))]
-                        leaf_pairs = itertools.combinations(ma,2) if a == b else itertools.product(ma,mb)
-                        for block in batches(leaf_pairs,args.batch_size):
-                            evaluate(db, block, pool, args)
-                # Task completion and child insertion are one atomic transaction.
-                with db:
-                    db.executemany("INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)", (tuple(sorted(pair)) for pair in children))
-                    db.execute("UPDATE tasks SET done=1 WHERE a=? AND b=?", (a,b))
-            if time.monotonic()-last > 25:
-                count = db.execute("SELECT count(*) FROM decisions").fetchone()[0]
-                print(f"[KOVAR] search: {count:,} queried pattern pairs; {time.monotonic()-started:.0f}s this invocation", flush=True)
-                last = time.monotonic()
+                        children=itertools.product((a,),cb)
+                transitions.append((a,b,children))
+            finish_leaves()
+            # Preserve atomic child scheduling/task completion while avoiding
+            # one FULL-synchronous transaction for every tiny traversal block.
+            with db:
+                for a,b,children in transitions:
+                    db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',(tuple(sorted(pair)) for pair in children))
+                    db.execute('UPDATE tasks SET done=1 WHERE a=? AND b=?',(a,b))
+            progress()
     with db:
-        set_meta(db, "search_complete", True)
+        set_meta(db,'search_complete',True)
 
 
 def import_nulls(db, work, info, args):
@@ -546,7 +624,7 @@ def distance_and_beta(db, work, pool, args):
                             "WHERE d.status='DISTAL' AND b.u IS NULL ORDER BY d.pv,d.pu")
         jobs = ((u,v) for u,v in cursor)
         completed,last=0,time.monotonic()
-        for row in bounded_map(pool,kernels.beta,jobs,args.threads):
+        for row in bounded_map(pool,kernels.beta,jobs,args.threads,ordered=False):
             with db:
                 db.execute("INSERT OR IGNORE INTO beta VALUES (?,?,?,?)",row)
             completed+=1
@@ -601,6 +679,9 @@ def export(db, info, work, args, total_seconds):
     summary.update(saved_local_null_statuses=null_statuses,
                    saved_local_null_fit_seconds=null_seconds,
                    available_imported_nulls=db.execute("SELECT count(*) FROM external_nulls").fetchone()[0])
+    summary['runtime_totals']=get_meta(db,'runtime_totals',{})
+    summary['memory_budget']=getattr(args,'_memory_info',None)
+    summary['execution_plan']=getattr(args,'_plan',None)
     atomic_json(args.out/"run_summary.json",summary)
 
 
@@ -608,6 +689,8 @@ def main(argv=None):
     args = parser().parse_args(argv)
     validate(args)
     started = time.monotonic()
+    args._memory_info=detect_budget(args.memory_gb,args.threads)
+    args.memory_gb=args._memory_info['working_gb']
     args.out = args.out.resolve()
     args.out.mkdir(parents=True,exist_ok=True)
     work = args.tmp_dir.resolve() if args.tmp_dir else args.out/".kovar_work"
@@ -633,14 +716,18 @@ def main(argv=None):
         if manifest.exists():
             if not args.resume:
                 raise ValueError("Existing work requires --resume")
-            if json.loads(manifest.read_text()) != expected:
-                raise ValueError("Input/code/statistical settings changed; use a new output")
+            from .discovery_compat import migrate_identity
+            if migrate_identity(json.loads(manifest.read_text()),expected,manifest):
+                print('[KOVAR] verified v0.9.0 checkpoint migrated; saved patterns, hierarchy, decisions and nulls retained',flush=True)
         else:
             atomic_json(manifest,expected)
         atomic_json(args.out/"run_identity.json",dict(expected,work_directory=str(work)))
         db = connect(work/"work.sqlite",min(64,args.memory_gb*1024*.05))
         try:
             schema(db)
+            if get_meta(db,'queried_pairs_count') is None:
+                with db:
+                    set_meta(db,'queried_pairs_count',db.execute('SELECT count(*) FROM decisions').fetchone()[0])
             with threadpool_limits(limits=args.threads):
                 info = prepare(args,db,work)
             family = math.comb(info["patterns"],2)
@@ -650,31 +737,31 @@ def main(argv=None):
             if args.screen_p < args.alpha/family:
                 raise ValueError("Screening gate must be at least as permissive as final significance")
             import_nulls(db,work,info,args)
-            n = info["n"]
-            # Conservative allocation for eigensolvers, PQL temporaries and one
-            # bounded predictor block. Mapped pattern pages are not duplicated.
-            per_worker = 160*n*n + 80*n*args.batch_size + (48<<20)
-            budget = args.memory_gb*(1<<30)
-            coordinator = (96<<20)+64*1024**2
-            if args.threads*per_worker+coordinator > budget:
-                raise ValueError(f"Memory budget too small for {args.threads} workers/{n} samples; "
-                                 f"request at least {(args.threads*per_worker+coordinator)/(1<<30):.2f} GiB or fewer --threads")
-            ram_nulls = max(1,min(32,int((budget-coordinator-args.threads*per_worker)/args.threads/max(24*n*n,1))))
+            n=info['n']
+            args._plan=plan_workers(args._memory_info,n,args.threads,args.batch_size)
+            with db:
+                set_meta(db,'memory_budget',args._memory_info)
+                set_meta(db,'resource_plan',args._plan)
             settings = dict(min_cell_count=args.min_cell_count,gate_critical=float(chi2.isf(args.screen_p,1)),
                             final_critical=float(chi2.isf(args.alpha/family,1)),exact=args.exact,
-                            ram_nulls=ram_nulls,require_cached_nulls=args.require_cached_nulls,batch_size=args.batch_size)
+                            require_cached_nulls=args.require_cached_nulls,batch_size=args.batch_size,**args._plan)
             print(f"[KOVAR {__version__}] {info['patterns']:,} patterns; {family:,} hypotheses; "
-                  f"final P <= {args.alpha/family:.6g}; workers={args.threads}; null RAM slots/worker={ram_nulls}",flush=True)
+                  f"final P <= {args.alpha/family:.6g}; workers={args.threads}; "
+                  f"cache/worker={args._plan['cache_bytes_per_worker']/(1<<30):.3f} GiB",flush=True)
+            print(f"[KOVAR] memory target={args.memory_gb:.3f} GiB; source={args._memory_info['limiting_source']}; "
+                  f"bounded query buffer={args._plan['query_buffer_pairs']:,} pairs",flush=True)
             print("[KOVAR] null cache upper storage estimate: "
                   f"{info['patterns']*12*n*n/(1<<30):.1f} GiB if every response is fitted; "
                   "pair checkpoints and expanded unitig results require additional disk space",flush=True)
-            # Spawn is portable and avoids forking live numerical thread pools.
-            with ProcessPoolExecutor(max_workers=args.threads,mp_context=multiprocessing.get_context("spawn"),
-                    initializer=kernels.initialize,initargs=(str(work),info,settings)) as pool:
+            with ResponsePool(args.threads,kernels.initialize,(str(work),info,settings)) as pool:
                 if args.search=="hierarchy":
                     make_hierarchy(db,info,pool,args)
                 search(db,info,pool,args)
-                distance_and_beta(db,work,pool,args)
+            # Release every score-worker cache before the external graph tool
+            # gets its own memory budget. Refit workers start lazily afterwards.
+            if args.unitig_distance:
+                with ResponsePool(args.threads,kernels.initialize,(str(work),info,settings)) as pool:
+                    distance_and_beta(db,work,pool,args)
             export(db,info,work,args,time.monotonic()-started)
             db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:
