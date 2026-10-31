@@ -22,7 +22,7 @@ import scipy
 from scipy.stats import chi2
 from threadpoolctl import threadpool_limits
 
-from . import __version__
+from . import __version__, __discovery_revision__
 from . import discovery_score as kernels
 from .discovery_store import atomic_json, connect, digest, prepare, write_gzip
 from .discovery_execution import ResponsePool, bounded_map
@@ -71,13 +71,19 @@ def parser():
     p.add_argument("--no-beta", action="store_true", help="Keep significance/distance results without post-hoc refits")
     p.add_argument("--reuse-nulls-from", type=Path, action="append", default=[], help="Previous v0.9 output or combined benchmark output")
     p.add_argument("--require-cached-nulls", action="store_true")
+    p.add_argument('--prefit-nulls',choices=['all','needed'],default='all',
+                   help='Fit all unique response nulls before scoring [all]; needed retains on-demand fitting')
+    p.add_argument('--prefit-only',action='store_true',help='Complete/resume null fitting and stop before pair testing')
+    p.add_argument('--null-cache-format',choices=['compact','full'],default='compact')
+    p.add_argument('--null-cache-rank',type=int,default=128,
+                   help='Retained spectral directions; omitted directions use conservative bounds or exact reconstruction [128]')
     p.add_argument("--resume", action="store_true", help="Reuse compatible completed work")
     p.add_argument("--version", action="version", version=__version__)
     return p
 
 
 def validate(args):
-    for name in ("threads", "batch_size", "distance_batch_size", "leaf_size", "max_reps", "kmer_length"):
+    for name in ("threads", "batch_size", "distance_batch_size", "leaf_size", "max_reps", "kmer_length",'null_cache_rank'):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_','-')} must be positive")
     if args.memory_gb is not None and (not np.isfinite(args.memory_gb) or args.memory_gb < .25):
@@ -89,6 +95,8 @@ def validate(args):
     if not 0 < args.coarse_r2 < 1 or any(not args.coarse_r2 < t <= 1 for t in args.refine_r2):
         raise ValueError("Refinement thresholds must exceed the coarse threshold and be <=1")
     args.refine_r2 = sorted(set(args.refine_r2))
+    if args.prefit_only:
+        args.prefit_nulls='all'
     if args.unitig_distance and not (args.unitigs and args.paths):
         raise ValueError("Distance calculation needs --unitigs and --paths")
 
@@ -96,15 +104,17 @@ def validate(args):
 def identity(args):
     # Execution resources can change on resume; statistical settings cannot.
     omitted = {"threads", "memory_gb", "out", "tmp_dir", "resume", "reuse_nulls_from", "require_cached_nulls",
-               "unitig_distance", "unitigs", "paths", "edges", "kmer_length", "distal_bp", "no_beta", "distance_batch_size", "batch_size"}
+               "unitig_distance", "unitigs", "paths", "edges", "kmer_length", "distal_bp", "no_beta", "distance_batch_size", "batch_size",
+               'prefit_nulls','prefit_only','null_cache_format','null_cache_rank'}
     settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()
                 if k not in omitted and not k.startswith('_')}
     inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
     code = {name: digest(Path(__file__).with_name(name)) for name in
             ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
-             "discovery_compat.py", "discovery_eligibility.py", "null_identity.py", "glmm.py", "kinship.py")}
+             "discovery_compat.py", "discovery_eligibility.py", 'discovery_null_cache.py','discovery_prefit.py',
+             "null_identity.py", "glmm.py", "kinship.py")}
     from .null_identity import null_source_hash
-    return dict(version=__version__, inputs=inputs, settings=settings, code=code,
+    return dict(version=__version__, execution_revision=__discovery_revision__,inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
 
 
@@ -125,6 +135,7 @@ def schema(db):
       t_low REAL,t_high REAL,p REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS discovery_hits ON decisions(final,u,v);
     CREATE TABLE IF NOT EXISTS external_nulls(pid INTEGER PRIMARY KEY,path TEXT);
+    CREATE TABLE IF NOT EXISTS null_aliases(pid INTEGER PRIMARY KEY,canonical INTEGER);
     CREATE TABLE IF NOT EXISTS beta(u INTEGER,v INTEGER,value REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS distance(u INTEGER,v INTEGER,pu INTEGER,pv INTEGER,
       distance REAL,connected INTEGER,status TEXT DEFAULT 'PENDING',PRIMARY KEY(u,v)) WITHOUT ROWID;
@@ -284,6 +295,8 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
     for block in batches(responses,400):
         marks=','.join('?' for _ in block)
         external.update(db.execute(f'SELECT pid,path FROM external_nulls WHERE pid IN ({marks})',block))
+        external.update(db.execute(f'SELECT a.pid,e.path FROM null_aliases a JOIN external_nulls e '
+                                   f'ON e.pid=a.canonical WHERE a.pid IN ({marks})',block))
     totals=dict(driver_db_read_seconds=time.perf_counter()-read_started)
     pending=[]
     def flush():
@@ -302,9 +315,12 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
     def jobs():
         for response,group in itertools.groupby(missing,key=lambda pair:pair[1]):
             yield response,[pair[0] for pair in group],external.get(response),screening
+    states={}
     for payload in bounded_map(pool,kernels.score_profiled,jobs(),args.threads,ordered=False):
         result=payload['rows']
         merge_metrics(totals,payload['metrics'])
+        if payload.get('worker_state'):
+            states[str(payload['worker_state']['pid'])]=payload['worker_state']
         pending.extend(result)
         known.update(((row[0],row[1]),(row[2],row[3])) for row in result)
         if len(pending)>=4096:
@@ -315,6 +331,10 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
         saved=get_meta(db,'runtime_totals',{})
         merge_metrics(saved,totals)
         set_meta(db,'runtime_totals',saved)
+        if states:
+            current=get_meta(db,'worker_state',{})
+            current.update(states)
+            set_meta(db,'worker_state',current)
     return known if return_mapping else [known[pair] for pair in requested]
 
 
@@ -332,6 +352,50 @@ class NodeCache:
         value=(size,children,reps,members)
         self.cache.put(node,value,256+40*(len(children)+len(reps)+len(members)))
         return value
+
+
+def coarse_tasks(db, roots, ordered, capacity, old_position=None, workers=1):
+    """Bounded concurrent response columns, excluding a frozen legacy prefix.
+
+    Several response columns advance together to occupy the worker pool. Each
+    column retains its null across batches; no dense root-pair matrix exists.
+    Old queued/completed tasks and their row-prefix remain untouched.
+    """
+    n=len(roots)
+    legacy=get_meta(db,'legacy_root_stop')
+    if legacy is None:
+        legacy=get_meta(db,'root_cursor',[0,1])
+        i,j=legacy
+        with db:
+            set_meta(db,'legacy_root_stop',legacy)
+            set_meta(db,'coarse_scheduled_count',i*(2*n-i-1)//2+j-i-1 if n>1 else 0)
+    active=get_meta(db,'response_coarse_columns',[])
+    next_right=get_meta(db,'response_coarse_next',1)
+    if next_right>=n and not active: return [],True
+    if old_position is None: old_position={node:i for i,node in enumerate(roots)}
+    fresh=[]
+    scanned=0
+    quantum=max(1,min(256,capacity//max(1,workers)))
+    while len(fresh)<capacity and scanned<max(4096,capacity*8):
+        while len(active)<workers and next_right<n:
+            active.append([next_right,0]);next_right+=1
+        if not active: break
+        right,left=active.pop(0)
+        accepted=0
+        while left<right and accepted<quantum and len(fresh)<capacity and scanned<max(4096,capacity*8):
+            a,b=ordered[left],ordered[right]
+            i,j=sorted((old_position[a],old_position[b]))
+            if not (i<legacy[0] or (i==legacy[0] and j<legacy[1])):
+                fresh.append(tuple(sorted((a,b))))
+                accepted+=1
+            left+=1;scanned+=1
+        if left<right: active.append([right,left])
+    with db:
+        db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',fresh)
+        set_meta(db,'response_coarse_columns',active)
+        set_meta(db,'response_coarse_next',next_right)
+        set_meta(db,'coarse_scheduled_count',get_meta(db,'coarse_scheduled_count',0)+len(fresh))
+    return fresh,next_right>=n and not active
 
 
 def search(db, info, pool, args):
@@ -382,6 +446,9 @@ def search(db, info, pool, args):
                 set_meta(db,'root_cursor',[0,1])
                 set_meta(db,'search_initialized',True)
         roots=[row[0] for row in db.execute('SELECT id FROM nodes WHERE parent=0 ORDER BY id')]
+        ordered=[row[0] for row in db.execute('SELECT n.id FROM nodes n JOIN reps r ON r.node=n.id '
+                                             'WHERE n.parent=0 GROUP BY n.id ORDER BY max(r.pid),n.id')]
+        old_position={node:i for i,node in enumerate(roots)}
         while True:
             # Reserve at least 3/4 of each frontier for queued refinements and
             # at most 1/4 for fresh coarse comparisons. Neither waits for the
@@ -389,20 +456,12 @@ def search(db, info, pool, args):
             quota=max(1,frontier//4)
             tasks=db.execute('SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT ?',
                              (max(1,frontier-quota),)).fetchall()
-            i,j=get_meta(db,'root_cursor')
-            fresh=[]
-            while i<len(roots)-1 and len(fresh)<frontier-len(tasks):
-                fresh.append((roots[i],roots[j]))
-                j+=1
-                if j==len(roots):
-                    i,j=i+1,i+2
-            if fresh:
-                with db:
-                    db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',fresh)
-                    set_meta(db,'root_cursor',[i,j])
-                tasks.extend(fresh)
+            fresh,coarse_done=coarse_tasks(db,roots,ordered,frontier-len(tasks),old_position,args.threads)
+            tasks.extend(fresh)
             if not tasks:
-                break
+                if coarse_done: break
+                progress()
+                continue
             summaries=eligibility.summaries(tasks) if eligibility else {}
             pruned={(a,b) for a,b in tasks if eligibility and eligibility.impossible(a,b,summaries)}
             def gate_pairs():
@@ -684,7 +743,7 @@ def export(db, info, work, args, total_seconds):
          "min_distance","connected_genomes","distance_status","beta","beta_status"],rows())
     counts = {str(state):count for state,count in db.execute("SELECT final,count(*) FROM decisions GROUP BY final")}
     family = args.bonferroni_tests or math.comb(info["patterns"],2)
-    summary = dict(version=__version__,work_directory=str(work.resolve()),
+    summary = dict(version=__version__,execution_revision=__discovery_revision__,work_directory=str(work.resolve()),
         samples=info["n"],excluded_samples=info["excluded"],original_unitigs=info["loci"],
         unique_patterns=info["patterns"],bonferroni_tests=family,alpha=args.alpha,
         raw_p_threshold=args.alpha/family,screen_p=args.screen_p,
@@ -709,6 +768,9 @@ def export(db, info, work, args, total_seconds):
                    saved_local_null_fit_seconds=null_seconds,
                    available_imported_nulls=db.execute("SELECT count(*) FROM external_nulls").fetchone()[0])
     summary['runtime_totals']=get_meta(db,'runtime_totals',{})
+    summary['prefit_runtime_totals']=get_meta(db,'prefit_runtime_totals',{})
+    summary['null_stage_summary']=get_meta(db,'null_stage_summary',{})
+    summary['worker_state']=get_meta(db,'worker_state',{})
     summary['hierarchy_metrics']=get_meta(db,'hierarchy_metrics',{})
     summary['block_eligibility_pruning']='necessary marginal counts and anchor-radius Hamming bounds; categories retained'
     summary['memory_budget']=getattr(args,'_memory_info',None)
@@ -775,15 +837,30 @@ def main(argv=None):
                 set_meta(db,'resource_plan',args._plan)
             settings = dict(min_cell_count=args.min_cell_count,gate_critical=float(chi2.isf(args.screen_p,1)),
                             final_critical=float(chi2.isf(args.alpha/family,1)),exact=args.exact,
-                            require_cached_nulls=args.require_cached_nulls,batch_size=args.batch_size,**args._plan)
+                            require_cached_nulls=args.require_cached_nulls,batch_size=args.batch_size,
+                            null_cache_format=args.null_cache_format,null_cache_rank=args.null_cache_rank,
+                            workers=args.threads,**args._plan)
+            print(f'[KOVAR] execution revision: {__discovery_revision__}; '
+                  f'null stage={args.prefit_nulls}; cache={args.null_cache_format}',flush=True)
             print(f"[KOVAR {__version__}] {info['patterns']:,} patterns; {family:,} hypotheses; "
                   f"final P <= {args.alpha/family:.6g}; workers={args.threads}; "
                   f"cache/worker={args._plan['cache_bytes_per_worker']/(1<<30):.3f} GiB",flush=True)
             print(f"[KOVAR] memory target={args.memory_gb:.3f} GiB; source={args._memory_info['limiting_source']}; "
                   f"bounded query buffer={args._plan['query_buffer_pairs']:,} pairs",flush=True)
-            print("[KOVAR] null cache upper storage estimate: "
-                  f"{info['patterns']*12*n*n/(1<<30):.1f} GiB if every response is fitted; "
+            estimate=8*n*min(args.null_cache_rank,n)+12*n*8 if args.null_cache_format=='compact' else 12*n*n
+            print("[KOVAR] numerical null-cache estimate before complement/shared/zero savings: "
+                  f"{info['patterns']*estimate/(1<<30):.1f} GiB; "
                   "pair checkpoints and expanded unitig results require additional disk space",flush=True)
+            if not get_meta(db,'search_complete') or args.prefit_only:
+                from .discovery_prefit import prefit
+                prefit(db,work,info,args,settings,get_meta,set_meta,merge_metrics)
+                if args.prefit_only:
+                    return 0
+            if args.prefit_nulls=='all':
+                settings['require_cached_nulls']=True
+            with db:
+                set_meta(db,'worker_state',{})
+                set_meta(db,'active_stage','pair_search')
             with ResponsePool(args.threads,kernels.initialize,(str(work),info,settings)) as pool:
                 if args.search=="hierarchy":
                     make_hierarchy(db,info,pool,args)
@@ -791,9 +868,11 @@ def main(argv=None):
             # Release every score-worker cache before the external graph tool
             # gets its own memory budget. Refit workers start lazily afterwards.
             if args.unitig_distance:
+                with db: set_meta(db,'active_stage','distance_and_beta')
                 with ResponsePool(args.threads,kernels.initialize,(str(work),info,settings)) as pool:
                     distance_and_beta(db,work,pool,args)
             export(db,info,work,args,time.monotonic()-started)
+            with db: set_meta(db,'active_stage','complete')
             db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:
             db.close()

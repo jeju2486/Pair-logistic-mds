@@ -65,11 +65,15 @@ def benchmark():
         if name=="exact":
             reference=hits
         metrics=summary.get('runtime_totals',{})
+        prefit=summary.get('prefit_runtime_totals',{})
         results.append(dict(method=name,seconds=summary["seconds_this_invocation"],
                             queries=summary["queried_pairs"],reference_hits=len(reference),hits=len(hits),
                             missed=len(reference-hits),extra=len(hits-reference),
                             recall=len(reference&hits)/len(reference) if reference else "NA",
                             null_fit_worker_seconds=metrics.get('null_fit_worker_seconds',0),
+                            prefit_null_fit_worker_seconds=prefit.get('null_fit_worker_seconds',0),
+                            prefit_cache_save_worker_seconds=prefit.get('cache_save_worker_seconds',0),
+                            reconstructed_spectra=metrics.get('cache_reconstructions',0),
                             cache_load_worker_seconds=metrics.get('cache_load_worker_seconds',0),
                             bounds_worker_seconds=metrics.get('bounds_worker_seconds',0),
                             exact_worker_seconds=metrics.get('exact_worker_seconds',0),

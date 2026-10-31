@@ -1,4 +1,4 @@
-"""Narrow restart migration from released v0.9.0/v0.9.1 implementations.
+"""Narrow restart migration from released v0.9.0/v0.9.1/original-v0.9.2.
 
 Only known source snapshots are accepted. Inputs, scientific settings, fitting
 source and NumPy/SciPy versions must still match; no guessed cache compatibility.
@@ -29,10 +29,24 @@ V091_CODE = {
 }
 
 
+V092_CODE = {
+    'discovery.py': {'50f5697ada7a119ab8cc464bef3a2db7fecf3ca81780451f93a140069714e28c', '4e13cebc29dea5d79be40e091b9166e7ec24a2ee78eb88e8e6293375f084b31d'},
+    'discovery_store.py': {'479fb111a52ff336de371bf5d9b54760d970cbd14443b2593bcbf70b2d92deec', 'bb82f663b2665472538ef680c287327ae382163b54dc6b7ad1f4a3d7d856df1f'},
+    'discovery_score.py': {'44f75dab744c10029218f4be01b9ff88d5fe2d5bc1a73b6fd64ad8138de882fa', '6e490bb0d484303d515ad0eaebb7e2117d9fee9c549acc2ea4854d91eaa8466e'},
+    'discovery_execution.py': {'d369ebe7cc9050dea018c4c19fb6abab9c6181e73329582af90326379bbf33a7', 'ea2f5c1ef74f026e369639146ba2db2e5b3eda52fb60927c178b95d057048b52'},
+    'memory_budget.py': {'03187b9171deed24e725c78477ac69fe6b6ac3cada7c2099d2db6d69b917fece', 'fa864be7581b9dcae14ab2abc2b5714873d68749079e3f287d450589ac014972'},
+    'discovery_compat.py': {'a9ff42fead9748236fc76059a7c2fbd1c91b55be7cc2f9867e093e7306bb2ba2', 'abe0cca5a8ef56dd13f9165288b7e0edb33df6755f2c683ec57c7df1a2a0deda'},
+    'discovery_eligibility.py': {'de0c9017ad641b726c8e1d7f1d77c598329e47b4f0642ea678945284cff4ab12', 'b98409612eecbdc42c9d9157cef25c261da4761a6c1d83045f2fb7334ce02f1a'},
+    'null_identity.py': {'8498a97a83d407af0be6b218621e2a01d3c4cda72a58b451adba3dc9b7718ea2', 'df135b2b7513b9029d1f39704d99be47a3e1d54575af49c947a5e88b6de0d4ec'},
+    'glmm.py': {'ab8fecb0f4af96feb6c77d8d2ff3a054d026bae20ec4b005da939ebb5f4b82b4', '0dc23fb4765055a12ffe8f173cef7ef30214a26a7ee98f7fdad9ddc2f3a87081'},
+    'kinship.py': {'35ac6734cd8976956cbcaf5d6b6f91af09a234eca19c5ead7425dae9f7a5eef7', 'e08b3b1a7926159b4a6d56b9a3600120df038c363f20934a9ebb89c9c43862c6'},
+}
+
+
 def migrate_identity(previous, expected, manifest):
     if previous == expected:
         return False
-    release = {"0.9.0":V090_CODE, "0.9.1":V091_CODE}.get(previous.get("version"))
+    release = {"0.9.0":V090_CODE, "0.9.1":V091_CODE, "0.9.2":V092_CODE}.get(previous.get("version"))
     if release is None or set(previous.get("code",{})) != set(release):
         raise ValueError("Input/code/statistical settings changed; use a new output")
     if any(previous["code"][key] not in values for key,values in release.items()):

@@ -12,9 +12,14 @@ It retains significant local pairs and estimates beta only for confirmed distal
 pairs. See the [v0.9 discovery guide](docs/discovery.md) for inputs, CPU/memory
 controls, restart, and the heuristic limits of representative pruning.
 The performance update adds allocation-aware memory/cache budgets, response
-affinity, bulk database operations and verified v0.9.0/v0.9.1 checkpoint migration.
+affinity, bulk database operations and verified release-checkpoint migration.
 Necessary joint-cell bounds skip ineligible hierarchy blocks while preserving
 their external associations. Coarse comparisons and queued refinements interleave.
+
+The current **0.9.2 execution revision `prefit-compact-1`** pre-fits the unique
+response pool, stores compact numerical caches, and groups coarse comparisons
+by response for reuse. The original `v0.9.2` Git tag is unchanged; use the
+`v0.9.2-perf1` tag or `codex/downstream-resume-progress` for this update.
 
 The legacy candidate-table scanner reports one result for each unordered pair. The separate
 `ko-variation-annotation` helper selects distal significant signals, calculates
@@ -24,7 +29,7 @@ See [downstream usage and interpretation](docs/downstream.md).
 ## Installation
 
 ```bash
-git clone --branch v0.9.2 https://github.com/jeju2486/Pair-logistic-mds.git
+git clone --branch v0.9.2-perf1 https://github.com/jeju2486/Pair-logistic-mds.git
 cd Pair-logistic-mds
 pip install -e .
 ko-variation --version
@@ -243,6 +248,17 @@ See `docs/model.md`, `docs/interpretation.md`, and `docs/research_basis.md` for
 more detail.
 
 ## Version history
+
+### 0.9.2 execution revision prefit-compact-1
+
+- fit missing canonical response nulls in a separate, parallel resumable stage;
+- preserve native saved fits and reuse successful complementary-pattern fits;
+- omit zero-variance/shared eigenvector copies and save bounded spectral bases
+  for general caches, reconstructing omitted directions only when needed;
+- recover cache capacity from actual headroom instead of geometric shrinkage;
+- traverse coarse comparisons by response while retaining legacy queued work;
+- expose live cache capacity, refusals, resident models and separate prefit timing;
+- provide `benchmarks/null_fit_benchmark.py`; the production fitter is unchanged.
 
 ### 0.9.2
 

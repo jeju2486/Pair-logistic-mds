@@ -14,7 +14,8 @@ import time
 import numpy as np
 from threadpoolctl import threadpool_limits
 
-from .discovery_store import atomic_json, digest, open_patterns
+from .discovery_store import digest, open_patterns
+from . import discovery_null_cache as null_cache
 from .glmm import (KinshipEigensystem, _WeightedEigen, fit_logistic_mixed,
                    fit_null_glmm, score_predictor_block)
 from .memory_budget import ByteLRU, working_usage, process_rss, MIB
@@ -35,6 +36,8 @@ def initialize(work, info, settings):
                   K=np.load(work/"K.npy", mmap_mode="r"),
                   eigen=KinshipEigensystem(np.load(work/"K_values.npy", mmap_mode="r"),
                       np.load(work/"K_vectors.npy", mmap_mode="r"), info["shared_covariance"]))
+    alias=work/"null_canonical.npy"
+    _STATE["canonical"]=np.load(alias,mmap_mode="r") if alias.exists() else None
 
 
 def metric(key,value=1):
@@ -46,7 +49,7 @@ def metric(key,value=1):
 def pressure_guard():
     s=_STATE
     now=time.monotonic()
-    if now-s["last_pressure"]<1:
+    if now-s["last_pressure"]<2:
         return
     s["last_pressure"]=now
     settings=s["settings"]
@@ -58,11 +61,43 @@ def pressure_guard():
     if usage is None or not target:
         return
     cache=s["nulls"]
+    s['observed_usage']=usage
+    s['observed_target']=target
     if usage>=target:
-        cache.trim(int(cache.limit*.75))
+        # Reduce RESIDENT bytes by our share of the excess, not the previous
+        # capacity geometrically. A repeated alarm with an empty cache must not
+        # permanently ratchet the admission budget to zero.
+        workers=max(1,settings.get('workers',1)) if settings.get('monitor') else 1
+        excess=max(1,int((usage-target)/workers))
+        before=cache.bytes
+        cache.trim(max(0,cache.bytes-max(excess,int(.1*cache.bytes))))
+        if before-cache.bytes>=16*MIB and now-s.get('last_allocator_trim',0)>30:
+            # Evicted NumPy allocations can remain in glibc arenas. Returning
+            # those free pages avoids mistaking allocator retention for live
+            # cache pressure. Unsupported platforms simply skip this hint.
+            s['last_allocator_trim']=now
+            try:
+                import ctypes
+                trim=ctypes.CDLL(None).malloc_trim
+                trim.argtypes=[ctypes.c_size_t]
+                trim.restype=ctypes.c_int
+                trim(0)
+                metric('allocator_trim_calls')
+            except (AttributeError,OSError):
+                pass
         metric("memory_pressure_events")
-    elif usage<target*.85 and cache.limit<s["cache_limit"]:
-        cache.limit=min(s["cache_limit"],cache.limit+max(16*MIB,int(.1*s["cache_limit"])))
+    elif cache.limit<s["cache_limit"]:
+        workers=max(1,settings.get('workers',1)) if settings.get('monitor') else 1
+        headroom=max(0,int((target-usage)/workers))
+        cache.limit=min(s["cache_limit"],cache.bytes+headroom)
+
+
+def worker_state():
+    s=_STATE
+    cache=s['nulls']
+    return dict(pid=os.getpid(),cache_limit=cache.limit,cache_bytes=cache.bytes,
+        cache_models=len(cache.items),cache_refused=cache.refused,
+        observed_usage=s.get('observed_usage'),observed_target=s.get('observed_target'))
 
 
 def cache_charge(cache):
@@ -74,6 +109,9 @@ def cache_charge(cache):
     arrays.extend(v for v in vars(cache["decomp"]).values() if isinstance(v,np.ndarray))
     for array in arrays:
         key=(array.__array_interface__["data"][0],array.nbytes)
+        if any(np.shares_memory(array,shared) for shared in
+               (_STATE.get("K",np.empty(0)),getattr(_STATE.get("eigen"),"eigenvectors",np.empty(0)))):
+            continue
         if key not in seen:
             seen.add(key)
             size+=array.nbytes
@@ -158,81 +196,119 @@ def central(job):
     return -float(values[order[0]]),int(ids[order[0]])
 
 
+def null_meta(pattern):
+    return _STATE['work']/'null_models'/f'{pattern//1000:06d}'/f'null_{pattern:09d}.json'
+
+
+def _view(value, pattern, canonical):
+    cache,status=value
+    if cache is not None and pattern!=canonical:
+        cache=dict(cache,y=bits([pattern])[0].astype(float),mu=1-cache['mu'],_base=cache)
+    return cache,status
+
+
 def get_null(pattern, external=None):
-    s = _STATE
+    s=_STATE
     pressure_guard()
     if s.get('active_null') is not None and s['active_null'][0]==pattern:
         metric('null_job_reuse_hits')
         return s['active_null'][1]
-    if pattern in s["nulls"]:
-        metric("null_cache_hits")
-        value=s['nulls'].get(pattern)
-        if 'active_null' in s:
-            s['active_null']=(pattern,value)
-        return value
-    load_started=time.perf_counter()
-    folder = s["work"]/"null_models"/f"{pattern//1000:06d}"
-    folder.mkdir(parents=True, exist_ok=True)
-    meta = folder/f"null_{pattern:09d}.json"
-    array = meta.with_suffix(".npz")
-    source = meta if meta.exists() else Path(external) if external else None
-    y = bits([pattern])[0].astype(float)
-    if source is not None:
-        metric("null_cache_disk_loads")
-        record = json.loads(source.read_text())
-        cache = None
-        if record["array"] is not None:
-            product = source.parent/record["array"]["name"]
-            verify_product(product,record["array"]["sha256"])
-            with np.load(product, allow_pickle=False) as saved:
-                cache = {key: saved[key] for key in ("y", "mu", "weights", "C", "Sinv_C", "M_inv")}
-                cache["tau"] = float(saved["tau"])
-                cache["decomp"] = _WeightedEigen(saved["sqrt_w"], saved["eigenvalues"],
-                    saved["eigenvectors"], float(saved["logdet_w_inverse"]))
-            if not np.array_equal(cache["y"], y):
-                raise ValueError("Cached null response differs")
-            verify_product(product,record["array"]["sha256"])
-        if record["status"] == "OK" and cache is None:
-            raise ValueError("Successful null cache has no arrays")
-        metric("cache_load_worker_seconds",time.perf_counter()-load_started)
+    canonical=int(s['canonical'][pattern]) if s.get('canonical') is not None else pattern
+    if canonical in s['nulls']:
+        metric('null_cache_hits')
+        value=s['nulls'].get(canonical)
     else:
-        if s["settings"]["require_cached_nulls"]:
-            raise ValueError(f"No cached null for pattern {pattern}")
-        started = time.monotonic()
-        if started-s["last_log"] > 25:
-            print(f"[KOVAR worker {os.getpid()}] fitting response pattern {pattern}",flush=True)
-            s["last_log"]=started
-        fit, cache = fit_null_glmm(pattern, y, s["K"], kinship_eigensystem=s["eigen"])
-        metric("new_null_fits")
-        metric("null_fit_worker_seconds",time.monotonic()-started)
-        record = dict(pattern=pattern, status=fit.status,
-                      fit_seconds=time.monotonic()-started, array=None)
-        save_started=time.perf_counter()
-        if fit.status == "OK" and cache:
-            decomp = cache["decomp"]
-            order = np.argsort(decomp.eigenvalues)[::-1]
-            decomp.eigenvalues = decomp.eigenvalues[order]
-            decomp.eigenvectors = np.ascontiguousarray(decomp.eigenvectors[:, order])
-            temporary = array.with_suffix(f".partial.{os.getpid()}")
-            with temporary.open("wb") as stream:
-                np.savez(stream, **{k: cache[k] for k in ("y", "mu", "weights", "tau", "C", "Sinv_C", "M_inv")},
-                    sqrt_w=decomp.sqrt_w, eigenvalues=decomp.eigenvalues,
-                    eigenvectors=decomp.eigenvectors, logdet_w_inverse=decomp.logdet_w_inverse)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, array)
-            record["array"] = dict(name=array.name, sha256=digest(array))
+        meta=null_meta(canonical)
+        source=meta if meta.exists() else Path(external) if external else None
+        cache=None
+        if source is not None:
+            started=time.perf_counter()
+            metric('null_cache_disk_loads')
+            record=json.loads(source.read_text())
+            if record['array'] is not None:
+                cache=null_cache.load(record,source,s['K'],s['eigen'],verify_product)
+                if not np.array_equal(cache['y'],bits([canonical])[0]):
+                    raise ValueError('Cached null response differs')
+            if record['status']=='OK' and cache is None:
+                raise ValueError('Successful null cache has no arrays')
+            metric('cache_load_worker_seconds',time.perf_counter()-started)
         else:
-            cache = None
-        atomic_json(meta, record)
-        metric("cache_save_worker_seconds",time.perf_counter()-save_started)
-    if cache is not None:
-        cache["_inverse_spectrum"]=1/(1+cache["tau"]*cache["decomp"].eigenvalues)
-    value = (cache, record["status"])
-    s["nulls"].put(pattern,value,cache_charge(cache))
+            if s['settings']['require_cached_nulls']:
+                raise ValueError(f'No cached null for pattern {canonical}')
+            started=time.monotonic()
+            if started-s['last_log']>25:
+                print(f'[KOVAR worker {os.getpid()}] fitting response pattern {canonical}',flush=True)
+                s['last_log']=started
+            fit,cache=fit_null_glmm(canonical,bits([canonical])[0].astype(float),s['K'],
+                                   kinship_eigensystem=s['eigen'])
+            metric('new_null_fits')
+            metric('null_fit_worker_seconds',time.monotonic()-started)
+            record=dict(pattern=canonical,status=fit.status,fit_seconds=time.monotonic()-started,
+                        iterations=fit.iterations,array=None)
+            if fit.status!='OK':
+                cache=None
+        compact=s['settings'].get('null_cache_format','full')=='compact'
+        rank=s['settings'].get('null_cache_rank',128)
+        compatible=null_cache.compatible(record,compact,rank,s['info']['n'])
+        if source is None or not compatible:
+            started=time.perf_counter()
+            if cache is not None and cache['decomp'].eigenvectors.shape[1]<min(rank,len(cache['y'])):
+                null_cache.complete(cache,s['K'],s['eigen'])
+            record=null_cache.save(meta.parent,canonical,cache,record,s['K'],s['eigen'],compact=compact,rank=rank)
+            metric('cache_save_worker_seconds',time.perf_counter()-started)
+        if cache is not None:
+            cache['_pattern']=canonical
+            cache['_inverse_spectrum']=1/(1+cache['tau']*cache['decomp'].eigenvalues)
+        value=(cache,record['status'])
+        s['nulls'].put(canonical,value,cache_charge(cache))
+    value=_view(value,pattern,canonical)
     if 'active_null' in s:
         s['active_null']=(pattern,value)
     return value
+
+
+def ensure_complete(cache):
+    started=time.perf_counter()
+    needed=cache['tau']!=0 and cache['decomp'].eigenvectors.shape[1]<len(cache['decomp'].eigenvalues)
+    if needed and null_cache.complete(cache,_STATE['K'],_STATE['eigen']):
+        metric('cache_reconstruct_worker_seconds',time.perf_counter()-started)
+        metric('cache_reconstructions')
+    base=cache.get('_base',cache)
+    base['_inverse_spectrum']=1/(1+cache['tau']*cache['decomp'].eigenvalues)
+    cache['_inverse_spectrum']=base['_inverse_spectrum']
+
+
+def prefit_profiled(job):
+    """Fit/convert one canonical pattern; never keep a full prefit pool in RAM."""
+    pattern,external=job
+    s=_STATE
+    before=dict(s['metrics'])
+    meta=null_meta(pattern)
+    source=meta if meta.exists() else Path(external) if external else None
+    record=json.loads(source.read_text()) if source is not None else None
+    compact=s['settings'].get('null_cache_format','full')=='compact'
+    rank=s['settings'].get('null_cache_rank',128)
+    ready=record is not None and null_cache.compatible(record,compact,rank,s['info']['n'])
+    if ready and record.get('array'):
+        product=source.parent/record['array']['name']
+        ready=product.is_file() and (not record['array'].get('bytes') or
+                                    product.stat().st_size==record['array']['bytes'])
+        if not ready:
+            raise ValueError(f'Missing/truncated saved null: {product}')
+    if not ready:
+        mapping=s.get('canonical')
+        s['canonical']=None
+        try:
+            _,status=get_null(pattern,external)
+        finally:
+            s['canonical']=mapping
+        record=json.loads((meta if meta.exists() else source).read_text())
+    # All validation/checksums occur on first actual numerical read. Inventory
+    # resumes avoid rereading every already-compact array merely to count it.
+    s['nulls'].items.clear()
+    s['nulls'].bytes=0
+    return dict(pattern=pattern,status=record['status'],mode=record.get('mode','failed'),
+                metrics={k:v-before.get(k,0) for k,v in s['metrics'].items()},worker_state=worker_state())
 
 
 def adaptive_statistics(X, cache, criticals, ranks=(0, 8, 16, 32, 64, 128)):
@@ -259,7 +335,10 @@ def adaptive_statistics(X, cache, criticals, ranks=(0, 8, 16, 32, 64, 128)):
         ids = np.flatnonzero(active)
         if not len(ids):
             break
-        if rank > previous:
+        if rank > previous and cache['tau']!=0:
+            if rank>decomp.eigenvectors.shape[1]:
+                ensure_complete(cache)
+                d=cache['_inverse_spectrum']
             z = decomp.eigenvectors[:, previous:rank].T @ A[:, ids]
             captured[ids] += np.sum(d[previous:rank, None]*z*z, axis=0)
             projected[ids] += np.sum(z*z, axis=0)
@@ -287,6 +366,7 @@ def adaptive_statistics(X, cache, criticals, ranks=(0, 8, 16, 32, 64, 128)):
     statuses = ["BOUNDED"]*width
     pending = np.flatnonzero(active)
     if len(pending):
+        ensure_complete(cache)
         started=time.perf_counter()
         for index, result in zip(pending, score_predictor_block(X[:, pending], cache, compute_spa_adjustment=False)):
             statuses[index] = result.status
@@ -322,6 +402,7 @@ def _score_chunk(job):
     # Ineligible pairs route the hierarchy, but can never become discoveries.
     cutoffs = [gate, np.where(eligible, final, gate)]
     if s["settings"]["exact"]:
+        ensure_complete(cache)
         started=time.perf_counter()
         lo, hi, p, statuses = np.zeros(len(predictors)), np.full(len(predictors), np.inf), [], []
         for i, result in enumerate(score_predictor_block(X, cache, compute_spa_adjustment=False)):
@@ -354,7 +435,13 @@ def score(job):
         for start in range(0,len(predictors),width):
             result.extend(_score_chunk((response,predictors[start:start+width],external,screening)))
     finally:
-        _STATE.pop('active_null',None)
+        active=_STATE.pop('active_null',None)
+        if active and active[1][0] is not None:
+            value,status=active[1]
+            base=value.get('_base',value)
+            key=base.get('_pattern')
+            if key in _STATE['nulls']:
+                _STATE['nulls'].put(key,(base,status),cache_charge(base))
     return result
 
 
@@ -368,7 +455,7 @@ def score_profiled(job):
     if "nulls" in _STATE:
         metrics["null_cache_evictions"]=_STATE["nulls"].evictions-old_evictions
         metrics["cache_peak_bytes_worker"]=_STATE["nulls"].peak_bytes
-    return dict(rows=rows,metrics=metrics)
+    return dict(rows=rows,metrics=metrics,worker_state=worker_state())
 
 
 def beta(job):

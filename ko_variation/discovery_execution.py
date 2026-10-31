@@ -12,13 +12,21 @@ class ResponsePool:
     def __init__(self, workers, initializer, initargs):
         self.workers = workers
         self.next_worker = 0
+        self.response_aliases=None
+        if initargs:
+            from pathlib import Path
+            import numpy as np
+            path=Path(initargs[0])/'null_canonical.npy'
+            if path.exists(): self.response_aliases=np.load(path,mmap_mode='r')
         context = multiprocessing.get_context("spawn")
         self.executors = [ProcessPoolExecutor(max_workers=1, mp_context=context,
                            initializer=initializer, initargs=initargs) for _ in range(workers)]
 
     def submit(self, function, job):
         if function.__name__ in {"score", "score_profiled"}:
-            index = int(job[0]) % self.workers
+            mapping=getattr(self,'response_aliases',None)
+            response=int(mapping[job[0]]) if mapping is not None else int(job[0])
+            index = response % self.workers
         else:
             index = self.next_worker % self.workers
             self.next_worker += 1

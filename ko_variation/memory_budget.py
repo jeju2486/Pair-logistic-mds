@@ -150,7 +150,9 @@ def working_usage(monitor):
     # Reclaimable inactive file cache should not force eviction of useful model
     # arrays just because memory-mapped/checkpoint files were read recently.
     stats = dict(line.split() for line in _read(monitor["stat"]).splitlines() if len(line.split()) == 2)
-    inactive = int(stats.get("inactive_file", stats.get("total_inactive_file", "0")))
+    # v1 usage includes descendants: use its matching hierarchical counter.
+    # v2 exposes the hierarchical value without the total_ prefix.
+    inactive = int(stats.get("total_inactive_file", stats.get("inactive_file", "0")))
     return max(0, usage-inactive)
 
 
@@ -166,7 +168,7 @@ class ByteLRU:
     """An eviction cache whose charge is supplied in bytes, not entry counts."""
     def __init__(self, limit):
         self.limit = max(0, int(limit))
-        self.bytes = self.peak_bytes = self.evictions = 0
+        self.bytes = self.peak_bytes = self.evictions = self.refused = 0
         self.items = OrderedDict()
 
     def get(self, key):
@@ -192,5 +194,7 @@ class ByteLRU:
         if charge <= self.limit:
             self.items[key] = value, charge
             self.bytes += charge
+        else:
+            self.refused += 1
         self.peak_bytes = max(self.peak_bytes, self.bytes)
         self.trim()

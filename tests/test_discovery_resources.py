@@ -96,9 +96,15 @@ class ResourceTests(unittest.TestCase):
                    settings=dict(monitor={'test':'fixture'},total_working_bytes=1000))
         with patch.dict(kernels._STATE,state,clear=True),patch('ko_variation.discovery_score.working_usage',return_value=1200):
             kernels.pressure_guard()
-            self.assertEqual(cache.limit,75)
-            self.assertLessEqual(cache.bytes,75)
+            self.assertEqual(cache.limit,0)
+            self.assertEqual(cache.bytes,0)
             self.assertEqual(kernels._STATE['metrics']['memory_pressure_events'],1)
+            kernels._STATE['last_pressure']=0.
+            with patch('ko_variation.discovery_score.working_usage',return_value=950):
+                kernels.pressure_guard()
+            self.assertEqual(cache.limit,50)
+            cache.put('recovered',1,40)
+            self.assertIn('recovered',cache)
             with tempfile.TemporaryDirectory() as temporary:
                 product=Path(temporary)/'model.npz'
                 product.write_bytes(b'abc')

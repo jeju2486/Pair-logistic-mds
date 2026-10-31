@@ -32,6 +32,7 @@ def main():
     manifest=json.loads((args.out/'run_identity.json').read_text())
     work=Path(manifest.get('work_directory',args.out/'.kovar_work'))
     report=dict(output=str(args.out.resolve()),work_directory=str(work),cpus=args.cpus,
+                execution_revision=manifest.get('execution_revision','original'),
                 note='Snapshot; saved fit durations include earlier invocations if this directory was resumed.')
     prepared=work/'prepared.json'
     if prepared.exists():
@@ -59,13 +60,17 @@ def main():
     db.execute('PRAGMA query_only=ON')
     try:
         report['meta']={key:json.loads(value) for key,value in db.execute(
-            "SELECT key,value FROM meta WHERE key IN ('hierarchy_complete','search_initialized','root_cursor','search_complete','distance_expanded','runtime_totals','hierarchy_metrics','queried_pairs_count','memory_budget','resource_plan')")}
+            "SELECT key,value FROM meta WHERE key IN ('hierarchy_complete','search_initialized','root_cursor','response_coarse_columns','response_coarse_next',"
+            "'coarse_scheduled_count','search_complete','distance_expanded','runtime_totals','prefit_runtime_totals',"
+            "'active_stage','null_stage_progress','null_stage_summary','worker_state','hierarchy_metrics','queried_pairs_count','memory_budget','resource_plan')")}
         roots=db.execute('SELECT count(*) FROM nodes WHERE parent=0').fetchone()[0]
         report['coarse_categories']=roots
         report['coarse_category_pairs']=roots*(roots-1)//2
         report['queried_pairs']=report['meta'].get('queried_pairs_count')
         report['runtime_totals']=report['meta'].pop('runtime_totals',{})
         report['hierarchy_metrics']=report['meta'].pop('hierarchy_metrics',{})
+        for key in ('prefit_runtime_totals','null_stage_summary','worker_state'):
+            report[key]=report['meta'].pop(key,{})
         if args.detailed:
             report['queried_pairs']=db.execute('SELECT count(*) FROM decisions').fetchone()[0]
             report['pair_counts_by_final_state']=dict(db.execute('SELECT final,count(*) FROM decisions GROUP BY final'))
@@ -77,6 +82,9 @@ def main():
             i,j=cursor
             report['coarse_pairs_scheduled']=i*(2*roots-i-1)//2+j-i-1
             report['still_processing_within_root_categories']=cursor==[0,1]
+        if 'coarse_scheduled_count' in report['meta']:
+            report['coarse_pairs_scheduled']=report['meta']['coarse_scheduled_count']
+            report['still_processing_within_root_categories']=report['coarse_pairs_scheduled']==0
     finally:
         db.close()
     if args.log:

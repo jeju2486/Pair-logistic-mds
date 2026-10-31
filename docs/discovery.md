@@ -1,5 +1,9 @@
 # Unitig discovery in KOVAR 0.9.2
 
+Current execution revision: **`prefit-compact-1`**, tagged `v0.9.2-perf1`.
+The original `v0.9.2` tag remains unchanged. `--version` still reports 0.9.2;
+the startup banner, identities and summaries identify the execution revision.
+
 `ko-variation discover` (also `ko-variation-discover`) accepts PAN-GWES unitig
 presence/absence directly. SpydrPick, MI and ARACNE are not required. The old
 `ko-variation --pairs ...` scanner remains available for existing workflows.
@@ -28,6 +32,77 @@ columns including count and minimum distance (columns 6 and 8, one-based).
 To defer graph-distance calculation and beta fitting, omit `--unitig-distance`.
 Add it on a later `--resume`; no significance scan is repeated. Use `--no-beta`
 for significance plus distance only. A subsequent resume can add beta.
+
+## Null stage and compact numerical caches
+
+The default `--prefit-nulls all` fits the full unique-response pool before pair
+testing. Existing local/imported valid fits are reused; only missing models
+are fitted. Each finished model or failed-fit status is checkpointed. The
+stage reports checked canonical patterns, status counts and complement aliases.
+Failed fits stay explicitly unresolved. A failed canonical complement fit is
+not blindly copied: its missing native complement is attempted independently.
+
+Use `--prefit-only` to finish this stage and stop. Repeat the same command with
+`--resume` and without `--prefit-only` to test pairs using cached models only.
+`--require-cached-nulls` prohibits missing fitting in either stage. Its first
+use therefore needs a completed compatible null pool. `--prefit-nulls needed`
+retains on-demand fitting for comparisons/diagnostics. All-pool fitting can fit
+models the hierarchy never needs; it is not an automatic total-runtime saving.
+
+Complement aliases share a fit without merging original patterns, graph nodes,
+joint-cell eligibility or the Bonferroni family. Existing native saved models
+take precedence, including their statuses. For an aliased complement, y and mu
+are transformed, retaining the appropriate signed score. Positive/negative
+association directions are not collapsed.
+
+`--null-cache-format compact` is the default. Successful caches store fitted
+probabilities, weights, tau and nuisance-projection quantities. Exactly zero
+tau omits eigenvectors. Exactly constant weights reference the already-saved
+global tree eigenvectors. General caches retain the complete eigenvalue
+spectrum plus up to `--null-cache-rank 128` eigenvectors. Omitted directions
+are covered by the existing outward variance bounds. If a later rank or exact
+fallback requires them, the weighted decomposition is reconstructed once for
+that resident response; the iterative null fit is not repeated. Float64 and
+the existing statistical criterion are retained. Reconstruction has a cost;
+measure it alongside the reduction in loading. `--null-cache-format full`
+retains complete general scoring matrices for a controlled comparison.
+
+Legacy local full caches convert without re-fitting. Data are published before
+their new manifests, and the superseded local array is removed only after the
+new manifest is committed. Imported source caches are not modified. A worker
+interrupted before publication can repeat conversion; completed fitting is
+retained. Conversion is one-time numerical I/O, not free work. During migration
+the old released script must not run against the changing cache format.
+
+Coarse representative comparisons now follow response-major triangular order,
+with several response columns advanced concurrently across the worker pool,
+so many predictors share one loaded response. The old scheduled row-prefix and
+all its pending/completed tasks remain recorded; a new cursor skips that prefix
+exactly. No internal-ineligibility decision deletes a node's external search.
+Coverage representatives still use the existing any-passing-proxy rule.
+
+Memory-pressure control uses resident bytes and available headroom; repeated
+alerts no longer geometrically reduce an empty cache forever. Cgroup-v1
+hierarchical usage uses matching hierarchical inactive-file counters. On glibc,
+large evictions can request allocator page release. Actual live cache limits,
+resident bytes/models and refused insertions are reported by worker. A truly
+exhausted budget can still disable admission safely and recover with headroom;
+the configured maximum is not a guarantee of live capacity.
+
+Whole-null-fit eigensolver profiling is available without changing production
+fitting or saved models:
+
+```bash
+python benchmarks/null_fit_benchmark.py --work kovar_v090/.kovar_work \
+  --out null_driver_comparison --patterns 12 --threads 4
+```
+
+The TSV/JSON compare NumPy and SciPy evd/evr on the same frozen response sample,
+with full-fit timings, decomposition/profiling subtimes, convergence statuses
+and fitted-probability/tau differences. The benchmark writes reports only.
+The production solver remains NumPy: a local three-pattern 613-isolate probe
+gave only about a 1% median improvement for evd, insufficient to justify a
+default change. This is not an ARC benchmark or a speedup guarantee.
 
 ## Inputs and identity
 
@@ -193,13 +268,13 @@ adjusted on resume; they are execution settings.
 Changing scientific settings requires a new output. Distances/beta can be added
 later, but changed distance inputs/cutoffs cannot overwrite earlier results.
 
-### Resume an existing v0.9.0 or v0.9.1 run
+### Resume a released v0.9.0, v0.9.1 or original v0.9.2 run
 
 Stop the running job **before updating its shared source checkout**. Then run
 v0.9.2 against the same OUT and original persistent work directory with `--resume`.
-The released v0.9.0/v0.9.1 source hashes (LF/CRLF), inputs, scientific settings, null-fit
+The released source hashes (LF/CRLF), inputs, scientific settings, null-fit
 source and numerical environment are verified. A compatible manifest is backed
-up as `run_identity.v090.json` or `run_identity.v091.json`; saved patterns, hierarchy, decisions, queued tasks
+up as `run_identity.v090.json`, `run_identity.v091.json` or `run_identity.v092.json`; saved patterns, hierarchy, decisions, queued tasks
 and null models are retained. Unknown edited implementations or changed science
 are rejected. The score test, Bonferroni family/alpha, gate and joint-cell rules
 are unchanged. Execution order changes do not provide a new recovery guarantee.
@@ -233,6 +308,7 @@ new search implementation.
   unqueried count, search interpretation, distance/effect statuses, resource
   plan and runtime counters.
 - `run_identity.json`: provenance for restart and cache compatibility.
+- `null_stage_summary.json`: canonical fitting statuses, cache modes and aliases.
 
 No exact P is manufactured for a bound-certified edge. A small P remains genomic
 association, not proof of a phenotype interaction, causality or mechanism.
@@ -256,6 +332,13 @@ heuristically pruned representative blocks. Progress also prints bound-certified
 pair decisions and exact evaluations. Block counts and pair counts have
 different denominators. New counters cover work completed by this version;
 they cannot reconstruct historical pruning or certified-decision counts.
+
+`prefit_runtime_totals` is separate from pair-stage `runtime_totals` so fitting
+is not hidden when reporting pair throughput. `null_stage_progress` and
+`active_stage` identify current work. `worker_state` contains live per-worker
+cache limits, resident bytes/model counts, admission refusals and observed
+memory usage/target. The inspector prefers `coarse_scheduled_count` over the
+legacy row cursor; it is still not an overall-completion percentage.
 
 An annotated distal map can use the existing network helper directly:
 

@@ -97,6 +97,14 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
             self.assertTrue((work/'run_identity.v091.json').exists())
             self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
+            from ko_variation.discovery_compat import V092_CODE
+            legacy=json.loads((work/'run_identity.json').read_text())
+            legacy.pop('execution_revision',None)
+            legacy['code']={key:sorted(values)[0] for key,values in V092_CODE.items()}
+            atomic_json(work/'run_identity.json',legacy)
+            self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
+            self.assertTrue((work/'run_identity.v092.json').exists())
+            self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
             exact_out = folder/"exact"
             self.assertEqual(main(common+["--out",str(exact_out),"--search","exhaustive","--exact",
                                           "--reuse-nulls-from",str(out),"--require-cached-nulls"]),0)
